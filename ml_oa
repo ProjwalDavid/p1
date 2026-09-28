@@ -1,0 +1,175 @@
+#ML
+Databricks Data
+      ↓
+Feature preparation
+      ↓
+ML Prediction Model
+      ↓
+Prediction / Probability
+      ↓
+OpenAI
+      ↓
+Business explanation
+
+```python
+# ============================================================
+# 1. IMPORT LIBRARIES
+# ============================================================
+
+import os
+import pandas as pd
+
+from openai import OpenAI
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report
+
+
+# ============================================================
+# 2. OPENAI CONNECTION
+# ============================================================
+
+# Recommended:
+# Store your API key in Databricks Secrets rather than hardcoding it.
+
+OPENAI_API_KEY = dbutils.secrets.get(
+    scope="openai",
+    key="api_key"
+)
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ============================================================
+# 3. SAMPLE DATA
+# ============================================================
+
+data = pd.DataFrame({
+    "AGE": [0, 1, 2, 0, 3, 2, 1, 4, 0, 3],
+    "DPD": [0, 15, 65, 0, 90, 60, 30, 120, 0, 75],
+    "FIN_AMT": [500000, 450000, 600000, 300000, 700000,
+                550000, 400000, 800000, 350000, 650000],
+
+    # Target:
+    # 1 = BAD
+    # 0 = GOOD
+    "BAD_FLAG": [0, 0, 1, 0, 1, 1, 0, 1, 0, 1]
+})
+
+
+# ============================================================
+# 4. DEFINE FEATURES AND TARGET
+# ============================================================
+
+features = [
+    "AGE",
+    "DPD",
+    "FIN_AMT"
+]
+
+X = data[features]
+y = data["BAD_FLAG"]
+
+
+# ============================================================
+# 5. TRAIN / TEST SPLIT
+# ============================================================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.30,
+    random_state=42,
+    stratify=y
+)
+
+
+# ============================================================
+# 6. TRAIN PREDICTION MODEL
+# ============================================================
+
+model = LogisticRegression()
+
+model.fit(X_train, y_train)
+
+
+# ============================================================
+# 7. MAKE PREDICTIONS
+# ============================================================
+
+y_pred = model.predict(X_test)
+
+y_probability = model.predict_proba(X_test)[:, 1]
+
+
+# ============================================================
+# 8. MODEL PERFORMANCE
+# ============================================================
+
+print("Accuracy:", accuracy_score(y_test, y_pred))
+
+print(
+    classification_report(
+        y_test,
+        y_pred
+    )
+)
+
+
+# ============================================================
+# 9. CREATE PREDICTION DATAFRAME
+# ============================================================
+
+prediction_df = X_test.copy()
+
+prediction_df["ACTUAL_BAD_FLAG"] = y_test.values
+
+prediction_df["PREDICTED_BAD_FLAG"] = y_pred
+
+prediction_df["BAD_PROBABILITY"] = y_probability
+
+display(prediction_df)
+
+
+# ============================================================
+# 10. SEND PREDICTION TO OPENAI
+# ============================================================
+
+sample_prediction = prediction_df.iloc[0]
+
+prompt = f"""
+You are a financial risk analytics assistant.
+
+A credit-risk prediction model has generated the following result:
+
+AGE: {sample_prediction['AGE']}
+DPD: {sample_prediction['DPD']}
+FIN_AMT: {sample_prediction['FIN_AMT']}
+Predicted BAD Flag: {sample_prediction['PREDICTED_BAD_FLAG']}
+BAD Probability: {sample_prediction['BAD_PROBABILITY']:.2%}
+
+Explain this prediction in simple business language.
+
+Provide:
+1. Risk interpretation
+2. Main factors contributing to the prediction
+3. Suggested collection/monitoring action
+4. Important limitations of this prediction
+
+Do not make a final lending decision.
+"""
+
+
+response = client.responses.create(
+    model="gpt-5.6-luna",
+    input=prompt
+)
+
+
+# ============================================================
+# 11. DISPLAY OPENAI EXPLANATION
+# ============================================================
+
+print(response.output_text)
+```
