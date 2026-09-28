@@ -179,3 +179,82 @@
 
 # MAGIC %sql
 # MAGIC select distinct count(*) from fusion_silverplus.dctran where ACC_IRR  and HPA_DATE between '2024-04-01' and '2026-03-31'
+
+
+
+
+
+
+
+--Autofin
+-- 1. EMI due per contract per month
+create or replace table risk_analytics.SANTOSH_INST_DT as
+select CONTRACT_NUMBER,
+       date_format(INSTALMENT_DATE,'yyyyMM')                          as INST_YYYYMM,
+       min(INSTALMENT_DATE)                                           as DUE_DATE,
+       concat_ws(',', array_sort(collect_list(cast(INSTALMENT_NO as string)))) as INST_NOS,
+       sum(INSTALMENT_AMOUNT)                                         as DUE_AMT
+from fusion_silverplus.cc_instalment_structure
+where INSTALMENT_DATE between '2025-04-01' and '2026-08-31'
+group by CONTRACT_NUMBER, date_format(INSTALMENT_DATE,'yyyyMM');
+
+-- 2. Cheque (PDC) receipts per contract per month
+create or replace table risk_analytics.SANTOSH_BR_DT as
+select REFERENCE_NUMBER                                    as CONTRACT_NUMBER,
+       date_format(RECEIPT_DATE,'yyyyMM')                  as RCPT_YYYYMM,
+       count(*)                                            as NO_OF_CHEQUES,
+       concat_ws(',', collect_list(INSTRUMENT_NUMBER))     as CHEQUE_NUMBERS,
+       min(RECEIPT_DATE)                                   as FIRST_RECEIPT_DATE,
+       max(IFSC_CODE)                                      as IFSC_CODE,
+       sum(<RECEIPT_AMOUNT_COLUMN>)                        as PDC_AMT   -- replace with the actual amount column
+from mmfsl_prod.autofin_silver.dc_online_receipt_header a
+join mmfsl_prod.autofin_silver.dc_online_receipt_details b
+  on a.ONLINE_NUMBER = b.ONLINE_NUMBER
+where RECEIPT_DATE between '2025-04-01' and '2026-08-31'
+  and INSTRUMENT_TYPE = '1.000000000000000000'
+  -- optional: keep only cheques registered as PDCs
+  -- and exists (select 1
+  --             from fusion_silverplus.pd_batch_master m
+  --             join fusion_silverplus.pd_cheque_details d on m.BATCH_NUMBER = d.BATCH_NUMBER
+  --             where d.CONTRACT_NUMBER = REFERENCE_NUMBER
+  --               and cast(d.CHEQUE_NUMBER as bigint) = cast(INSTRUMENT_NUMBER as bigint))
+group by REFERENCE_NUMBER, date_format(RECEIPT_DATE,'yyyyMM');
+
+-- 3. Short PDC cases
+create or replace table risk_analytics.SANTOSH_FNL_DATA as
+select p.CONTRACT_NUMBER as NEW_HPANO, p.RCPT_YYYYMM, p.NO_OF_CHEQUES, p.CHEQUE_NUMBERS,
+       p.FIRST_RECEIPT_DATE, p.IFSC_CODE, p.PDC_AMT,
+       i.DUE_DATE, i.INST_NOS, i.DUE_AMT,
+       i.DUE_AMT - p.PDC_AMT as SHORTFALL
+from risk_analytics.SANTOSH_BR_DT p
+join risk_analytics.SANTOSH_INST_DT i
+  on p.CONTRACT_NUMBER = i.CONTRACT_NUMBER
+ and p.RCPT_YYYYMM     = i.INST_YYYYMM
+where p.PDC_AMT < i.DUE_AMT;
+
+-- 4. Enrich with customer details
+select a.*,
+       b.NAME as Customer_name,
+       mmfsl_prod.admin.fn_decrypt(c.PAN) as Customer_PAN,
+       b.BRANCH as Contract_Branch, b.STATUS as Contract_status,
+       b.AGE as OD_Age, b.OUTSTAND as OD_amount
+from risk_analytics.SANTOSH_FNL_DATA a
+left join fusion_silverplus.dctran     b on a.NEW_HPANO = b.NEW_HPANO
+left join fusion_silverplus.tbl_dc_extn c on a.NEW_HPANO = c.NEW_HPANO;
+
+
+
+---- Finnone 
+select r.LOAN_ACCOUNT_NUMBER, r.RCPT_yyyymm,
+       count(*)                                                as NO_OF_CHEQUES,
+       concat_ws(',', collect_list(r.Instrument_Reference_Number)) as CHEQUE_NUMBERS,
+       sum(r.Receipt_Amount)                                   as PDC_AMT,
+       i.DUE_DATE, i.INST_NOS, i.DUE_AMT,
+       i.DUE_AMT - sum(r.Receipt_Amount)                       as SHORTFALL
+from risk_analytics.SANTOSH_FINN_RECEIPT r
+join risk_analytics.SANTOSH_INST_DT i
+  on r.LOAN_ACCOUNT_NUMBER = i.CONTRACT_NUMBER
+ and r.RCPT_yyyymm         = i.INST_YYYYMM
+where r.Receipt_Status = 'Realized'
+group by r.LOAN_ACCOUNT_NUMBER, r.RCPT_yyyymm, i.DUE_DATE, i.INST_NOS, i.DUE_AMT
+having sum(r.Receipt_Amount) < i.DUE_AMT;
