@@ -139,3 +139,32 @@ SELECT
 FROM first_emi_bounce_detail
 GROUP BY emi_yyyymm, fiscal_year, fiscal_quarter, src
 ORDER BY emi_yyyymm, src;
+
+
+-- 5. Contract-wise list: every first EMI due Apr-25 to Aug-26 that bounced
+--    (presentation-level bounce OR DPD proxy), one row per contract
+SELECT
+    contract_number,
+    src,
+    first_emi_date,
+    emi_yyyymm,
+    fiscal_year,
+    fiscal_quarter,
+    first_emi_bounce_flag,
+    dpd_proxy_flag,
+    return_reason,
+    CASE
+        WHEN first_emi_bounce_flag = 'Y' AND dpd_proxy_flag = 'Y' THEN 'Bounce + DPD'
+        WHEN first_emi_bounce_flag = 'Y'                          THEN 'Bounce only'
+        WHEN dpd_proxy_flag = 'Y'                                 THEN 'DPD only'
+    END AS evidence
+FROM first_emi_bounce_detail
+WHERE first_emi_bounce_flag = 'Y'
+   OR dpd_proxy_flag = 'Y'
+ORDER BY first_emi_date, src, contract_number;
+ 
+-- To get the full population (bounced and not bounced), drop the WHERE clause.
+-- To persist for sharing / Excel export:
+-- CREATE OR REPLACE TABLE risk_analytics.first_emi_bounce_apr25_aug26 AS
+-- SELECT * FROM first_emi_bounce_detail;
+ 
