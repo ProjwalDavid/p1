@@ -69,4 +69,58 @@ CREATE or REPLACE TEMp view gu as
 
 
 ----
+%sql
+CREATE OR REPLACE TEMPORARY VIEW landlichen_ckyc AS
+WITH mm AS (
+    SELECT DISTINCT CLUSTER_ID, NEW_HPANO
+    FROM udaanapi_gold.tb_dctran
+    WHERE status IN ('L', 'R', 'U')
+      AND BUS_VERTICAL IN ('PNH', 'PVA', 'PHL', 'PSH')
+),
+glb AS (
+    SELECT REFERENCE_NUMBER,
+           ENTITY_CODE AS global_cif,
+           ENTITY_TYPE AS Customer_variant,
+           CLUSTER_ID
+    FROM mmfsl_prod.fusion_silverplus.contract_cust_cluster_id_link
+    WHERE REFERENCE_NUMBER IN (SELECT NEW_HPANO FROM mm)
+),
+parties AS (
+    SELECT `Loan_Account_#` AS NEW_HPANO, Customer_ID, Customer_Name AS Party_Name, 'applicant' AS Identifier
+    FROM finnone_silver.fct_loan_details
+    WHERE `Loan_Account_#` IN (SELECT NEW_HPANO FROM mm)
+    UNION
+    SELECT APPLICATION_NUMBER, NEO_CIF, CO_BORROWER_NAME, 'co-borrower'
+    FROM finnone_silver.dim_cas_co_borrowers
+    WHERE APPLICATION_NUMBER IN (SELECT NEW_HPANO FROM mm)
+    UNION
+    SELECT APPLICATION_NUMBER, NEO_CIF, GUARANTOR_NAME, 'guarantor'
+    FROM finnone_silver.dim_cas_guarantor
+    WHERE APPLICATION_NUMBER IN (SELECT NEW_HPANO FROM mm)
+),
+ovd AS (
+    SELECT Customer_Number,
+           MAX(CASE WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'AADHAR%'
+                      OR UPPER(IDENTIFICATION_TYPE) LIKE 'AADHAAR%'
+                    THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER) END) AS AADHAR
+    FROM finnone_silver.dim_customer_identification_details
+    WHERE IDENTIFICATION_NUMBER IS NOT NULL
+      AND Customer_Number IN (SELECT global_cif FROM glb)
+    GROUP BY Customer_Number
+)
+SELECT p.NEW_HPANO,
+       m.CLUSTER_ID,
+       p.Identifier,
+       p.Customer_ID,
+       p.Party_Name,
+       g.Customer_variant,
+       o.AADHAR
+FROM parties p
+JOIN mm m
+  ON m.NEW_HPANO = p.NEW_HPANO
+LEFT JOIN glb g
+  ON g.REFERENCE_NUMBER = p.NEW_HPANO
+ AND g.global_cif = p.Customer_ID
+LEFT JOIN ovd o
+  ON o.Customer_Number = p.Customer_ID;
 
