@@ -1,0 +1,72 @@
+%sql
+CREATE OR REPLACE TEMPORARY view mm as 
+SELECT CLUSTER_ID,  NEW_HPANO from udaanapi_gold.tb_dctran 
+where status in ( 'L', 'R', 'U') 
+and BUS_VERTICAL in ( 'PNH', 'PVA', 'PHL', 'PSH')
+
+create or replace  temporary view OVD_DATA as
+SELECT
+    Associated_Loan_Application_ID,
+    Customer_Number,
+
+    --MAX(CASE
+    --        WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'PAN%'
+    --        THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER) 
+    --    END) AS PAN,
+
+    --MAX(CASE
+    --        WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'PASSPORT%'
+    --        THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER)
+    --    END) AS PASSPORT,
+
+    --MAX(CASE
+    --        WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'FORM 60%'
+    --        THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER)
+    --    END) AS FORM_60,
+
+    --MAX(CASE
+    --        WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'DRIVING LICENCE%'
+    --        THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER)
+    --    END) AS DRIVING_LICENCE,
+
+    --MAX(CASE
+    --        WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'VOTER%'
+    --        THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER)
+    --    END) AS VOTER_ID,
+
+    MAX(CASE
+            WHEN UPPER(IDENTIFICATION_TYPE) LIKE 'AADHAR%'
+              OR UPPER(IDENTIFICATION_TYPE) LIKE 'AADHAAR%'
+            THEN mmfsl_prod.admin.fn_decrypt(IDENTIFICATION_NUMBER)
+        END) AS AADHAR
+
+FROM finnone_silver.dim_customer_identification_details
+WHERE IDENTIFICATION_NUMBER IS NOT NULL and Customer_Number in (SELECT global_cif FROM glb)
+GROUP BY
+    Associated_Loan_Application_ID,
+    Customer_Number;
+-------
+
+%sql
+CREATE OR REPLACE TEMPORARY VIEW glb as
+SELECT ENTITY_CODE as global_cif, ENTITY_TYPE as Customer_variant, CLUSTER_ID  FROM mmfsl_prod.fusion_silverplus.contract_cust_cluster_id_link WHERE REFERENCE_NUMBER in (SELECT new_hpano FROM mm);
+
+%sql
+CREATE or REPLACE TEMp view coap as 
+  SELECT APPLICATION_NUMBER as NEW_HPANO ,NEO_CIF AS Customer_ID, CO_BORROWER_NAME as CO_BORROWER_NAME,'co-borrower' AS Identifier
+  FROM finnone_silver.dim_cas_co_borrowers
+  WHERE application_number in (SELECT new_hpano FROM mm);
+%sql
+CREATE or replace temp view app as 
+ SELECT DISTINCT `Loan_Account_#`,Customer_ID,Customer_Name ,'applicant_id' AS Identifier
+  FROM finnone_silver.fct_loan_details
+  WHERE `Loan_Account_#` in (SELECT new_hpano FROM mm);
+%sql
+CREATE or REPLACE TEMp view gu as 
+  SELECT APPLICATION_NUMBER as NEW_HPANO ,NEO_CIF AS Customer_ID,GUARANTOR_NAME ,'guarantor' AS Identifier
+  FROM finnone_silver.dim_cas_guarantor
+  WHERE application_number in (SELECT new_hpano FROM mm)
+
+
+----
+
