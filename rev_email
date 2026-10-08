@@ -1,0 +1,266 @@
+import win32com.client
+import pandas as pd
+from datetime import datetime
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+TARGET_DATE = datetime(2026, 10, 7)
+
+# Put Mayur's actual email ID here if you know it.
+MAYUR_NAME = "Mayur Meshram"
+
+# SAFETY SWITCH
+# True  = only identify emails, NOTHING will be deleted
+# False = move matching emails to Outlook Deleted Items
+DRY_RUN = True
+
+
+# ============================================================
+# CONNECT TO OUTLOOK
+# ============================================================
+
+outlook = win32com.client.Dispatch("Outlook.Application")
+namespace = outlook.GetNamespace("MAPI")
+
+# Inbox
+inbox = namespace.GetDefaultFolder(6)
+
+# Deleted Items
+deleted_items = namespace.GetDefaultFolder(3)
+
+
+# ============================================================
+# DATE RANGE
+# ============================================================
+
+start_date = TARGET_DATE.replace(
+    hour=0,
+    minute=0,
+    second=0,
+    microsecond=0
+)
+
+end_date = TARGET_DATE.replace(
+    hour=23,
+    minute=59,
+    second=59,
+    microsecond=999999
+)
+
+
+# ============================================================
+# GET EMAILS
+# ============================================================
+
+messages = inbox.Items
+
+# Newest first
+messages.Sort("[ReceivedTime]", True)
+
+
+# ============================================================
+# FUNCTION TO GET EMAIL ADDRESS
+# ============================================================
+
+def get_email_address(recipient):
+
+    # Try Exchange
+    try:
+
+        exch_user = recipient.AddressEntry.GetExchangeUser()
+
+        if exch_user:
+            return exch_user.PrimarySmtpAddress
+
+    except:
+        pass
+
+    # Try PropertyAccessor
+    try:
+
+        return recipient.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+        )
+
+    except:
+        pass
+
+    # Final fallback
+    try:
+        return recipient.Address
+    except:
+        return None
+
+
+# ============================================================
+# PROCESS
+# ============================================================
+
+candidates = []
+
+for msg in messages:
+
+    try:
+
+        # Only normal emails
+        if msg.MessageClass != "IPM.Note":
+            continue
+
+
+        # ----------------------------------------------------
+        # RECEIVED DATE
+        # ----------------------------------------------------
+
+        received_date = msg.ReceivedTime.replace(tzinfo=None)
+
+
+        # Since emails are sorted newest → oldest,
+        # stop when we go before 07-Oct-2026
+
+        if received_date < start_date:
+            break
+
+        if received_date > end_date:
+            continue
+
+
+        # ----------------------------------------------------
+        # CHECK RECIPIENTS
+        # ----------------------------------------------------
+
+        mayur_found = False
+
+        to_list = []
+        cc_list = []
+
+        for recipient in msg.Recipients:
+
+            email = get_email_address(recipient)
+
+            if not email:
+                continue
+
+            email = str(email).strip().lower()
+
+            # TO
+            if recipient.Type == 1:
+
+                to_list.append(email)
+
+                if (
+                    MAYUR_NAME.lower() in str(recipient.Name).lower()
+                    or
+                    "mayur.meshram" in email
+                ):
+                    mayur_found = True
+
+
+            # CC
+            elif recipient.Type == 2:
+
+                cc_list.append(email)
+
+                if (
+                    MAYUR_NAME.lower() in str(recipient.Name).lower()
+                    or
+                    "mayur.meshram" in email
+                ):
+                    mayur_found = True
+
+
+        # ----------------------------------------------------
+        # MAYUR NOT MARKED
+        # ----------------------------------------------------
+
+        if not mayur_found:
+
+            candidates.append({
+                "message": msg,
+                "received": received_date,
+                "sender": str(msg.SenderName or ""),
+                "subject": str(msg.Subject or ""),
+                "to": ", ".join(to_list),
+                "cc": ", ".join(cc_list)
+            })
+
+
+    except Exception as e:
+
+        print("Error:", e)
+
+
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+
+print()
+print("=" * 100)
+print("EMAIL CLEANUP REPORT")
+print("=" * 100)
+
+print(f"Target Date       : {TARGET_DATE.strftime('%d-%b-%Y')}")
+print(f"Mayur             : {MAYUR_NAME}")
+print(f"Emails Found      : {len(candidates)}")
+print(f"DRY RUN           : {DRY_RUN}")
+
+print("=" * 100)
+
+
+for i, item in enumerate(candidates, start=1):
+
+    print()
+    print(f"{i}. {item['received']}")
+    print(f"   From    : {item['sender']}")
+    print(f"   Subject : {item['subject']}")
+    print(f"   TO      : {item['to']}")
+    print(f"   CC      : {item['cc']}")
+
+
+# ============================================================
+# MOVE TO DELETED ITEMS
+# ============================================================
+
+if not DRY_RUN:
+
+    print()
+    print("Moving emails to Deleted Items...")
+    print()
+
+    moved = 0
+
+    for item in candidates:
+
+        try:
+
+            item["message"].Move(deleted_items)
+
+            moved += 1
+
+            print(
+                f"Moved: {item['subject']}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Could not move: {item['subject']}"
+            )
+
+            print(e)
+
+
+    print()
+    print("=" * 100)
+    print(f"Emails moved to Deleted Items : {moved}")
+    print("=" * 100)
+
+else:
+
+    print()
+    print("=" * 100)
+    print("DRY RUN ONLY")
+    print("NO EMAILS WERE DELETED OR MOVED.")
+    print("=" * 100)
