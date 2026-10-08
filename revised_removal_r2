@@ -1,0 +1,297 @@
+"""
+Outlook email inventory with two time-window rules:
+
+  Window A : 0   - 180 days old  -> randomly remove 50% of "data request" emails
+                                    (all other emails in this window are kept)
+  Window B : 181 - 365 days old  -> keep ONLY emails where Mayur is in TO/CC,
+                                    remove everything else
+
+Kept emails go to the "kept" sheet; removed emails go to a "removed" sheet
+with the reason, so every decision can be audited.
+"""
+
+import win32com.client
+import pandas as pd
+import hashlib
+import re
+import os
+from datetime import datetime, timedelta, timezone
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+RECENT_WINDOW_DAYS = 180          # Window A: 0 .. 180 days old
+TOTAL_WINDOW_DAYS = 365           # Window B: 181 .. 365 days old
+
+DATA_REQUEST_DROP_FRACTION = 0.50 # share of data-request mails removed in Window A
+SAMPLING_SEED = "mmfsl-2026"      # change to get a different (but repeatable) 50%
+
+TARGET_RECIPIENTS = {
+    "mayur.meshram@mahindrafinance.com",
+}
+
+# Keywords that mark an email as a "data request" (checked in subject + body, case-insensitive)
+DATA_REQUEST_PATTERNS = [
+    r"\bdata\s+request",
+    r"\brequest\s+for\s+(the\s+)?data\b",
+    r"\bdata\s+requirement",
+    r"\bdata\s+pull\b",
+    r"\bdata\s+extract",
+    r"\bdata\s+dump\b",
+    r"\b(need|require|requesting|share|send|provide)\s+(the\s+|us\s+|me\s+)?data\b",
+]
+CHECK_BODY_FOR_DATA_REQUEST = True  # False = check subject only (stricter)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_FILE = fr"D:\email_inventory_filtered_{timestamp}.xlsx"
+TRACKING_FILE = r"D:\proces_filtered.csv"
+
+TARGET_RECIPIENTS = {e.strip().lower() for e in TARGET_RECIPIENTS}
+DATA_REQUEST_RE = re.compile("|".join(DATA_REQUEST_PATTERNS), re.IGNORECASE)
+
+# =====================================================
+# LOAD PROCESSED IDS
+# =====================================================
+
+processed_ids = set()
+
+if os.path.exists(TRACKING_FILE):
+    try:
+        processed_df = pd.read_csv(TRACKING_FILE)
+        processed_ids = set(processed_df["entry_id"].astype(str))
+        print(f"Loaded {len(processed_ids)} processed IDs")
+    except Exception as e:
+        print(f"Could not read tracking file: {e}")
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+
+
+def get_smtp_address(recipient):
+    """Resolve a recipient to an SMTP address (handles Exchange EX: addresses)."""
+    try:
+        exch_user = recipient.AddressEntry.GetExchangeUser()
+        if exch_user and exch_user.PrimarySmtpAddress:
+            return exch_user.PrimarySmtpAddress
+    except Exception:
+        pass
+    try:
+        addr = recipient.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS)
+        if addr:
+            return addr
+    except Exception:
+        pass
+    try:
+        return recipient.Address
+    except Exception:
+        return None
+
+
+def clean_body(body_raw):
+    body = body_raw or ""
+    for p in (r"(?is)-----Original Message-----.*", r"(?is)From:.*?Sent:.*"):
+        body = re.sub(p, "", body)
+    return body.strip()
+
+
+def is_data_request(subject, body):
+    text = subject if not CHECK_BODY_FOR_DATA_REQUEST else f"{subject}\n{body}"
+    return bool(DATA_REQUEST_RE.search(text))
+
+
+def in_drop_sample(entry_id, fraction):
+    """Deterministic 'coin flip' per email: same email -> same decision on every run."""
+    h = hashlib.md5(f"{SAMPLING_SEED}|{entry_id}".encode()).hexdigest()
+    return (int(h[:8], 16) / 0xFFFFFFFF) < fraction
+
+
+# =====================================================
+# OUTLOOK CONNECTION
+# =====================================================
+
+outlook = win32com.client.Dispatch("Outlook.Application")
+namespace = outlook.GetNamespace("MAPI")
+inbox = namespace.GetDefaultFolder(6)
+messages = inbox.Items
+messages.Sort("[ReceivedTime]", True)
+
+# =====================================================
+# DATE BOUNDARIES
+# =====================================================
+
+now_utc = datetime.now(timezone.utc)
+recent_cutoff_utc = now_utc - timedelta(days=RECENT_WINDOW_DAYS)   # Window A starts here
+total_cutoff_utc = now_utc - timedelta(days=TOTAL_WINDOW_DAYS)     # stop scanning here
+extract_timestamp = now_utc.isoformat()
+local_tz = datetime.now().astimezone().tzinfo
+
+kept_records, removed_records, new_processed = [], [], []
+
+# =====================================================
+# PROCESS EMAILS
+# =====================================================
+
+for msg in messages:
+    try:
+        if msg.MessageClass != "IPM.Note":
+            continue
+
+        # ---------------- TIME ----------------
+        received_local = pd.Timestamp(msg.ReceivedTime)
+        if received_local.tzinfo is None:
+            received_local = received_local.tz_localize(local_tz)
+        received_utc = received_local.tz_convert("UTC")
+        received_dt = received_utc.to_pydatetime()
+
+        if received_dt < total_cutoff_utc:
+            break
+
+        entry_id = str(msg.EntryID)
+        if entry_id in processed_ids:
+            continue
+
+        window = "A_0-180d" if received_dt >= recent_cutoff_utc else "B_181-365d"
+
+        # ---------------- RECIPIENTS ----------------
+        to_list, cc_list = [], []
+        for r in msg.Recipients:
+            email = get_smtp_address(r)
+            if not email:
+                continue
+            if r.Type == 1:
+                to_list.append(email)
+            elif r.Type == 2:
+                cc_list.append(email)
+
+        recipients_lower = {e.strip().lower() for e in to_list + cc_list}
+        marked_to_target = bool(recipients_lower & TARGET_RECIPIENTS)
+
+        # ---------------- SUBJECT / BODY ----------------
+        subject = str(msg.Subject or "")
+        try:
+            body_clean = clean_body(msg.Body)
+        except Exception:
+            body_clean = ""
+
+        data_request = is_data_request(subject, body_clean)
+
+        # ---------------- FILTER RULES ----------------
+        remove_reason = None
+        if window == "A_0-180d":
+            if data_request and in_drop_sample(entry_id, DATA_REQUEST_DROP_FRACTION):
+                remove_reason = "Window A: data request, in 50% drop sample"
+        else:
+            if not marked_to_target:
+                remove_reason = "Window B: Mayur not in TO/CC"
+
+        # ---------------- SENDER ----------------
+        sender_name, sender_email = None, None
+        try:
+            sender_name = msg.SenderName
+        except Exception:
+            pass
+        try:
+            exch_user = msg.Sender.GetExchangeUser()
+            if exch_user:
+                sender_email = exch_user.PrimarySmtpAddress
+        except Exception:
+            pass
+        if not sender_email:
+            try:
+                sender_email = msg.SenderEmailAddress
+            except Exception:
+                pass
+
+        # ---------------- CONVERSATION ----------------
+        try:
+            conversation_id = msg.ConversationID
+        except Exception:
+            conversation_id = None
+        try:
+            conversation_topic = msg.ConversationTopic
+        except Exception:
+            conversation_topic = None
+
+        # ---------------- RECORD ----------------
+        record = {
+            "extract_timestamp": extract_timestamp,
+            "entry_id": entry_id,
+            "window": window,
+            "is_data_request": data_request,
+            "marked_to_mayur": marked_to_target,
+            "conversation_id": conversation_id,
+            "conversation_topic": conversation_topic,
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "to_emails": ",".join(sorted(set(to_list))),
+            "cc_emails": ",".join(sorted(set(cc_list))),
+            "recipient_count": msg.Recipients.Count,
+            "subject": subject,
+            "received_local": received_local.isoformat(),
+            "received_utc": received_utc.isoformat(),
+            "attachment_count": msg.Attachments.Count,
+            "body_clean": body_clean,
+        }
+
+        if remove_reason:
+            record["remove_reason"] = remove_reason
+            removed_records.append(record)
+        else:
+            kept_records.append(record)
+
+        new_processed.append({
+            "entry_id": entry_id,
+            "processed_timestamp": extract_timestamp,
+            "decision": "removed" if remove_reason else "kept",
+        })
+
+    except Exception as e:
+        print(e)
+
+# =====================================================
+# WRITE OUTPUT
+# =====================================================
+
+kept_df = pd.DataFrame(kept_records).astype(str)
+removed_df = pd.DataFrame(removed_records).astype(str)
+
+if len(kept_df) or len(removed_df):
+    with pd.ExcelWriter(OUTPUT_FILE) as writer:
+        kept_df.to_excel(writer, sheet_name="kept", index=False)
+        removed_df.to_excel(writer, sheet_name="removed", index=False)
+
+if new_processed:
+    tracking_df = pd.DataFrame(new_processed)
+    tracking_df.to_csv(
+        TRACKING_FILE,
+        mode="a" if os.path.exists(TRACKING_FILE) else "w",
+        header=not os.path.exists(TRACKING_FILE),
+        index=False,
+    )
+
+# =====================================================
+# SUMMARY
+# =====================================================
+
+def count(records, **cond):
+    return sum(all(r.get(k) == v for k, v in cond.items()) for r in records)
+
+a_dr_total = count(kept_records, window="A_0-180d", is_data_request=True) + \
+             count(removed_records, window="A_0-180d")
+
+print("=" * 64)
+print(f"Window A (0-180d)   kept        : {count(kept_records, window='A_0-180d')}")
+print(f"                    data requests: {a_dr_total}  "
+      f"(removed {count(removed_records, window='A_0-180d')})")
+print(f"Window B (181-365d) kept (Mayur): {count(kept_records, window='B_181-365d')}")
+print(f"                    removed     : {count(removed_records, window='B_181-365d')}")
+print("-" * 64)
+print(f"Total kept    : {len(kept_records)}")
+print(f"Total removed : {len(removed_records)}")
+print(f"Output File   : {OUTPUT_FILE}")
+print(f"Tracking File : {TRACKING_FILE}")
+print("=" * 64)
