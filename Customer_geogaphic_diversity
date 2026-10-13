@@ -1,0 +1,270 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import re, textwrap, os
+
+base = Path("/mnt/data")
+src = base / "pincodes.csv"
+df = pd.read_csv(src, low_memory=False)
+df.columns = [str(c).strip().lower() for c in df.columns]
+
+# Identify expected columns robustly
+pin_col = "pincode" if "pincode" in df.columns else next((c for c in df.columns if "pin" in c), None)
+state_col = "statename" if "statename" in df.columns else next((c for c in df.columns if "state" in c), None)
+district_col = "district" if "district" in df.columns else next((c for c in df.columns if "district" in c), None)
+office_col = "officename" if "officename" in df.columns else next((c for c in df.columns if "office" in c), None)
+
+if not all([pin_col, state_col, district_col]):
+    raise ValueError(f"Could not identify required columns. Available: {list(df.columns)}")
+
+df["customer_pincode"] = df[pin_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+df["customer_pincode"] = df["customer_pincode"].where(df["customer_pincode"].str.fullmatch(r"\d{6}", na=False), pd.NA)
+df["state_clean"] = df[state_col].astype("string").str.strip().str.upper()
+df["district_clean"] = df[district_col].astype("string").str.strip().str.upper()
+df["office_clean"] = df[office_col].astype("string").str.strip().str.upper() if office_col else pd.NA
+
+# Normalize state names and assign broad business zones. Union Territories mapped with neighboring/business region conventions.
+state_zone = {
+    "JAMMU AND KASHMIR": "North", "JAMMU & KASHMIR": "North", "LADAKH": "North",
+    "HIMACHAL PRADESH": "North", "PUNJAB": "North", "HARYANA": "North",
+    "CHANDIGARH": "North", "DELHI": "North", "NCT OF DELHI": "North",
+    "UTTARAKHAND": "North", "UTTAR PRADESH": "North",
+    "RAJASTHAN": "North", "MADHYA PRADESH": "Central", "CHHATTISGARH": "Central",
+    "MAHARASHTRA": "West", "GOA": "West", "GUJARAT": "West",
+    "DADRA AND NAGAR HAVELI": "West", "DADRA & NAGAR HAVELI": "West",
+    "DAMAN AND DIU": "West", "DAMAN & DIU": "West",
+    "ANDHRA PRADESH": "South", "TELANGANA": "South", "KARNATAKA": "South",
+    "KERALA": "South", "TAMIL NADU": "South", "PUDUCHERRY": "South",
+    "LAKSHADWEEP": "South", "ANDAMAN AND NICOBAR ISLANDS": "South",
+    "ANDAMAN & NICOBAR ISLANDS": "South",
+    "BIHAR": "East", "JHARKHAND": "East", "ODISHA": "East",
+    "WEST BENGAL": "East", "SIKKIM": "East",
+    "ASSAM": "North East", "ARUNACHAL PRADESH": "North East",
+    "MANIPUR": "North East", "MEGHALAYA": "North East", "MIZORAM": "North East",
+    "NAGALAND": "North East", "TRIPURA": "North East",
+}
+df["zone"] = df["state_clean"].map(state_zone).fillna("UNMAPPED")
+
+# Deduplicate exact rows and produce one representative point per PIN with dominant state/district.
+df = df.drop_duplicates().copy()
+agg = {
+    "state_clean": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else pd.NA,
+    "district_clean": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else pd.NA,
+    "zone": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else "UNMAPPED",
+    "office_clean": "nunique",
+}
+if "latitude" in df.columns:
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    agg["latitude"] = lambda s: s[df.loc[s.index, "latitude"].between(6, 38) & pd.to_numeric(df.loc[s.index, "longitude"], errors="coerce").between(68, 98)].mean() if "longitude" in df.columns else s.mean()
+if "longitude" in df.columns:
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    # ensure latitude exists for range validation
+    if "latitude" in df.columns:
+        pass
+    agg["longitude"] = "mean"
+
+pin_master = df[df["customer_pincode"].notna()].groupby("customer_pincode", as_index=False).agg(**{
+    "state": ("state_clean", lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else pd.NA),
+    "district": ("district_clean", lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else pd.NA),
+    "zone": ("zone", lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else "UNMAPPED"),
+    "post_office_count": ("office_clean", "nunique"),
+})
+# attach a point from valid coordinates using a separate aggregation
+if "latitude" in df.columns and "longitude" in df.columns:
+    valid = df[df["latitude"].between(6,38) & df["longitude"].between(68,98) & df["customer_pincode"].notna()]
+    pts = valid.groupby("customer_pincode", as_index=False).agg(latitude=("latitude","mean"), longitude=("longitude","mean"))
+    pin_master = pin_master.merge(pts, on="customer_pincode", how="left")
+else:
+    pin_master["latitude"] = np.nan
+    pin_master["longitude"] = np.nan
+
+# No city-tier/population fields are present in postal master, so avoid false assignment.
+pin_master["tier"] = "UNCLASSIFIED"
+pin_master["tier_rule"] = "Requires agreed city/town classification or population/city lookup"
+pin_master["zone_rule"] = "State/UT-based broad business zone; confirm against internal regional structure"
+
+out_master = base / "pincode_zone_tier_master.csv"
+pin_master.to_csv(out_master, index=False)
+
+# Summary of PIN master mapping coverage
+zone_summary = pin_master.groupby("zone", dropna=False).agg(
+    unique_pincodes=("customer_pincode","nunique"),
+    states=("state","nunique"),
+    districts=("district","nunique"),
+    pincodes_with_coordinates=("latitude", lambda s: int(s.notna().sum()))
+).reset_index()
+zone_summary.to_csv(base / "pincode_zone_master_summary.csv", index=False)
+
+# Portfolio analysis starter script using the enriched master
+script = r'''"""
+NBFC PIN-code, tier, zone and loan geographic distribution analysis.
+
+Files:
+  pincode_zone_tier_master.csv  (created from your pincode master)
+  portfolio.csv                 (your loan-level file)
+
+Install:
+  pip install pandas numpy folium
+
+Run:
+  python nbfc_geo_portfolio_summary.py --portfolio portfolio.csv
+
+Expected/adjustable loan columns in CONFIG:
+  customer_pincode, contract_id, outstanding, finance_amount, dpd_days,
+  status, branch, business_vertical
+
+Outputs:
+  outputs/loan_level_geo_enriched.csv
+  outputs/pincode_loan_summary.csv
+  outputs/tier_loan_summary.csv
+  outputs/zone_loan_summary.csv
+  outputs/zone_tier_loan_summary.csv
+  outputs/geographic_coverage_map.html
+
+Tier caution:
+  Tier is intentionally UNCLASSIFIED until you supply/approve a city-tier mapping.
+  Do not infer tier from PIN digits or coordinates. Join a city/town tier lookup.
+"""
+from pathlib import Path
+import argparse
+import numpy as np
+import pandas as pd
+
+CONFIG = {
+    "pin_col": "customer_pincode",
+    "contract_col": "contract_id",
+    "outstanding_col": "outstanding",
+    "finance_amount_col": "finance_amount",
+    "dpd_col": "dpd_days",
+    "status_col": "status",
+    "branch_col": "branch",
+    "vertical_col": "business_vertical",
+    "eligible_statuses": ["L", "LIVE"],
+    "dpd_buckets": {"30+": 30, "60+": 60, "90+": 90},
+}
+
+def norm_pin(s):
+    x = s.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    return x.where(x.str.fullmatch(r"\d{6}", na=False), pd.NA)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--portfolio", required=True)
+    ap.add_argument("--master", default="pincode_zone_tier_master.csv")
+    ap.add_argument("--out-dir", default="outputs")
+    args = ap.parse_args()
+    out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
+
+    master = pd.read_csv(args.master, dtype={"customer_pincode":"string"})
+    master["customer_pincode"] = norm_pin(master["customer_pincode"])
+    master = master.drop_duplicates("customer_pincode")
+
+    loans = pd.read_csv(args.portfolio, low_memory=False)
+    loans.columns = [str(c).strip().lower() for c in loans.columns]
+    pin_col = CONFIG["pin_col"].lower()
+    if pin_col not in loans.columns:
+        raise ValueError(f"PIN column '{pin_col}' missing. Available columns: {list(loans.columns)}")
+    loans["customer_pincode"] = norm_pin(loans[pin_col])
+
+    mapping = {
+        "contract_id": CONFIG["contract_col"].lower(),
+        "outstanding": CONFIG["outstanding_col"].lower(),
+        "finance_amount": CONFIG["finance_amount_col"].lower(),
+        "dpd_days": CONFIG["dpd_col"].lower(),
+        "status": CONFIG["status_col"].lower(),
+        "branch": CONFIG["branch_col"].lower(),
+        "business_vertical": CONFIG["vertical_col"].lower(),
+    }
+    for target, src in mapping.items():
+        loans[target] = loans[src] if src in loans.columns else pd.NA
+    for c in ["outstanding","finance_amount","dpd_days"]:
+        loans[c] = pd.to_numeric(loans[c], errors="coerce")
+    loans["status_norm"] = loans["status"].astype("string").str.strip().str.upper()
+    if loans["status"].isna().all():
+        loans["eligible_account"] = True
+    else:
+        loans["eligible_account"] = loans["status_norm"].isin([s.upper() for s in CONFIG["eligible_statuses"]])
+    for label, threshold in CONFIG["dpd_buckets"].items():
+        loans[f"dpd_{label.replace('+','plus')}_flag"] = loans["dpd_days"].ge(threshold)
+
+    loans = loans.merge(
+        master[["customer_pincode","state","district","zone","tier","latitude","longitude"]],
+        on="customer_pincode", how="left", validate="many_to_one"
+    )
+    loans["geo_match"] = loans["zone"].notna() & loans["zone"].ne("UNMAPPED")
+    loans["outstanding_eligible"] = loans["outstanding"].where(loans["eligible_account"], 0).fillna(0)
+    loans["outstanding_30_plus"] = loans["outstanding"].where(loans["eligible_account"] & loans["dpd_days"].ge(30), 0).fillna(0)
+    loans["outstanding_60_plus"] = loans["outstanding"].where(loans["eligible_account"] & loans["dpd_days"].ge(60), 0).fillna(0)
+    loans["outstanding_90_plus"] = loans["outstanding"].where(loans["eligible_account"] & loans["dpd_days"].ge(90), 0).fillna(0)
+
+    enriched_path = out / "loan_level_geo_enriched.csv"
+    loans.to_csv(enriched_path, index=False)
+
+    def summarize(keys, path):
+        g = loans.groupby(keys, dropna=False).agg(
+            loan_rows=("customer_pincode","size"),
+            unique_contracts=("contract_id", lambda s: s.dropna().nunique() if s.notna().any() else len(s)),
+            unique_pincodes=("customer_pincode","nunique"),
+            eligible_accounts=("eligible_account","sum"),
+            finance_amount=("finance_amount","sum"),
+            outstanding_total=("outstanding","sum"),
+            outstanding_eligible=("outstanding_eligible","sum"),
+            outstanding_30_plus=("outstanding_30_plus","sum"),
+            outstanding_60_plus=("outstanding_60_plus","sum"),
+            outstanding_90_plus=("outstanding_90_plus","sum"),
+            geo_matched_loans=("geo_match","sum"),
+        ).reset_index()
+        for bucket in ["30","60","90"]:
+            g[f"{bucket}_plus_outstanding_share_pct"] = np.where(
+                g["outstanding_eligible"] > 0,
+                100 * g[f"outstanding_{bucket}_plus"] / g["outstanding_eligible"], np.nan
+            )
+        g["geo_match_rate_pct"] = np.where(g["loan_rows"] > 0, 100*g["geo_matched_loans"]/g["loan_rows"], np.nan)
+        g.to_csv(out / path, index=False)
+        return g
+
+    pin = summarize(["customer_pincode","state","district","zone","tier"], "pincode_loan_summary.csv")
+    tier = summarize(["tier"], "tier_loan_summary.csv")
+    zone = summarize(["zone"], "zone_loan_summary.csv")
+    zone_tier = summarize(["zone","tier"], "zone_tier_loan_summary.csv")
+
+    # Point map of PIN summary. Points are representative post-office coordinates, not PIN boundaries.
+    try:
+        import folium
+        from folium.plugins import MarkerCluster
+        mdata = pin.dropna(subset=["latitude","longitude"]).copy() if "latitude" in pin.columns else pd.DataFrame()
+        if not mdata.empty:
+            m = folium.Map(location=[22.5,79.0], zoom_start=5, tiles="CartoDB positron")
+            cluster = MarkerCluster(name="Customer PIN codes").add_to(m)
+            for _, r in mdata.iterrows():
+                folium.CircleMarker(
+                    location=[float(r["latitude"]),float(r["longitude"])],
+                    radius=max(3,min(12,3+np.log1p(max(0,float(r["loan_rows"])))*1.1)),
+                    tooltip=f"PIN {r['customer_pincode']} | Loans {int(r['loan_rows'])}",
+                    popup=f"Zone: {r['zone']}<br>Tier: {r['tier']}<br>Loans: {int(r['loan_rows'])}<br>Eligible outstanding: {float(r['outstanding_eligible']):,.0f}<br>90+ DPD outstanding: {float(r['outstanding_90_plus']):,.0f}",
+                    fill=True
+                ).add_to(cluster)
+            folium.LayerControl().add_to(m)
+            m.save(str(out / "geographic_coverage_map.html"))
+    except ImportError:
+        print("Install folium to create the map: pip install folium")
+
+    print("Completed. Review geo_match_rate_pct and unclassified tiers before interpreting coverage.")
+    print(f"Output folder: {out.resolve()}")
+
+if __name__ == "__main__":
+    main()
+'''
+script_path = base / "nbfc_geo_portfolio_summary.py"
+script_path.write_text(script, encoding="utf-8")
+
+# tier lookup template to populate/approve from internal policy or agreed city-tier source
+tier_template = pd.DataFrame(columns=["city_or_town", "district", "state", "tier", "classification_source", "effective_date"])
+tier_template_path = base / "city_tier_lookup_template.csv"
+tier_template.to_csv(tier_template_path, index=False)
+
+print("Created:")
+for p in [out_master, base/"pincode_zone_master_summary.csv", script_path, tier_template_path]:
+    print(f"- {p.name} ({p.stat().st_size:,} bytes)")
+print("\nPIN master zone counts:")
+print(zone_summary.to_string(index=False))
