@@ -1,0 +1,36 @@
+SQL
+WITH base AS (
+    SELECT  a.NEW_HPANO,
+            CAST(a.HPA_DATE AS DATE)        AS HPA_DATE,
+            a.REGNO,
+            b.BUS_VERTICAL
+    FROM    fusion_monthly.dc202609 a
+    LEFT JOIN udaanapi_gold.tb_dctran b
+           ON CAST(a.NEW_HPANO AS STRING) = CAST(b.NEW_HPANO AS STRING)
+    WHERE   a.STATUS IN ('L','R','U','6','7','8')
+      AND   COALESCE(a.SOH,0) + COALESCE(a.OUTSTAND,0) > 0
+      AND   a.acct_yyyymm NOT IN ('202610')            -- run month
+),
+pdd AS (
+    SELECT  CAST(NEW_HPANO AS STRING) AS NEW_HPANO,
+            MAX(RCV_DATE)             AS RCV_DATE      -- one row per contract
+    FROM    fusion_monthly.tbl_dashboard_pdd_finaloutput_202609
+    GROUP BY CAST(NEW_HPANO AS STRING)
+),
+bre AS (
+    SELECT  b.NEW_HPANO,
+            b.HPA_DATE,
+            p.RCV_DATE,
+            ADD_MONTHS(TO_DATE('202609','yyyyMM'), 1) AS REF_DATE   -- 1st of month after report month
+    FROM    base b
+    LEFT JOIN pdd p ON CAST(b.NEW_HPANO AS STRING) = p.NEW_HPANO
+    WHERE   b.BUS_VERTICAL = 'BRE'
+)
+SELECT  NEW_HPANO,
+        HPA_DATE,
+        RCV_DATE,
+        CASE WHEN RCV_DATE IS NULL THEN DATEDIFF(REF_DATE, HPA_DATE) END              AS RC_PENDENCY_DAYS,
+        CASE WHEN RCV_DATE IS NULL AND DATEDIFF(REF_DATE, HPA_DATE) > 60 THEN 1 ELSE 0 END AS CNT_RC_PENDENCY_60_FLAG,
+        CASE WHEN RCV_DATE IS NULL AND DATEDIFF(REF_DATE, HPA_DATE) > 90 THEN 1 ELSE 0 END AS CNT_RC_PENDENCY_90_FLAG,
+        CASE WHEN RCV_DATE IS NULL THEN 'RC Not Received' ELSE 'RC Received' END       AS RC_Pending
+FROM    bre;
