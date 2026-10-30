@@ -1,0 +1,1641 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Table & Column Usage Scanner
+# MAGIC
+# MAGIC Walks every notebook and code file under the configured workspace folders, parses the
+# MAGIC SQL (`%sql` cells, `spark.sql(...)` strings, `.sql` files) and the PySpark DataFrame code
+# MAGIC (`spark.table`, `spark.read.table`, `select`, `withColumn`, `F.col`, `join`, `saveAsTable`, ...)
+# MAGIC and writes **one row per script / schema / table / column** used.
+# MAGIC
+# MAGIC **How to use:** import this file into your workspace, attach it to a cluster, set the widgets at the
+# MAGIC top, then *Run all*. The result is written to the CSV path (and, optionally, a Delta table) and displayed.
+# MAGIC
+# MAGIC Output columns: `script_path, script_type, language, cell_no, source_kind, access_type,
+# MAGIC catalog_name, schema_name, table_name, column_name, resolution`
+# MAGIC
+# MAGIC `resolution` tells you how sure the mapping is:
+# MAGIC | value | meaning |
+# MAGIC |---|---|
+# MAGIC | `VERIFIED` | column confirmed to exist in that table (via information_schema) |
+# MAGIC | `QUALIFIED` | SQL column explicitly tied to the table (`t.col` or single-table query) |
+# MAGIC | `SINGLE_SOURCE` | DataFrame column on a DataFrame built from exactly one table |
+# MAGIC | `VIA_STAR` / `VIA_TEMP_VIEW` / `VIA_UNION` | traced through `SELECT *`, a temp view, or a DataFrame union |
+# MAGIC | `INFERRED` | column was ambiguous, but every other candidate table was ruled out |
+# MAGIC | `STAR` / `STAR_EXPANDED` | `SELECT *` (expanded to real columns when the schema is known) |
+# MAGIC | `AMBIGUOUS` | column could belong to any of several joined tables (one row per candidate) |
+# MAGIC | `TABLE_ONLY` | table used but no specific column could be identified (e.g. `count(*)`, writes) |
+# MAGIC
+# MAGIC Can also run outside Databricks on an exported folder:
+# MAGIC `python table_column_usage_scanner.py --path ./my_export --out usage.csv [--schema-csv cols.csv]`
+
+# COMMAND ----------
+
+# MAGIC %pip install -q sqlglot
+
+# COMMAND ----------
+
+import ast
+import base64
+import csv
+import fnmatch
+import json
+import os
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, traverse_scope
+
+DIALECT = "databricks"
+IN_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+TableKey = Tuple[str, str, str]          # (catalog, schema, table) – '' when unknown
+
+OUTPUT_COLUMNS = [
+    "script_path", "script_type", "language", "cell_no", "source_kind", "access_type",
+    "catalog_name", "schema_name", "table_name", "column_name", "resolution",
+]
+
+NOCAT, NODB, TV = "__nocat__", "__nodb__", "__tv__"
+
+
+# ----------------------------------------------------------------------------- data classes
+@dataclass(frozen=True)
+class Event:
+    cell_no: int
+    source_kind: str                       # SQL | PYSPARK
+    access_type: str                       # READ | WRITE
+    candidates: Tuple[TableKey, ...]
+    column: Optional[str]                  # None => table-level event
+    resolution: str
+
+
+@dataclass(frozen=True)
+class DF:
+    """What we know about a DataFrame variable / expression."""
+    tables: FrozenSet[TableKey]
+    derived: FrozenSet[str] = frozenset()  # columns created in code (not physical)
+    writer: bool = False                   # df.write / df.writeStream chain
+    aliases: FrozenSet[Tuple[str, FrozenSet[TableKey]]] = frozenset()   # df.alias("c")
+    union: bool = False                    # built by union(): a column comes from *every* source
+
+
+@dataclass
+class Script:
+    path: str
+    script_type: str                       # NOTEBOOK | FILE
+    language: str                          # python | sql | scala | r
+    text: str
+
+
+# ----------------------------------------------------------------------------- helpers
+def placeholder(name: str) -> str:
+    """Identifier-safe stand-in for an unresolved variable, e.g. {env} -> __env__."""
+    return "__" + re.sub(r"\W+", "_", name).strip("_") + "__"
+
+
+PH_RX = re.compile(r"__([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*?)__")
+
+
+def pretty(name: str) -> str:
+    """__env___audit -> {env}_audit for display."""
+    if not name or name in (NOCAT, NODB, TV):
+        return "" if name in (NOCAT, NODB) else (name or "")
+    return PH_RX.sub(lambda m: "{" + m.group(1) + "}", name)
+
+
+def split_ident(s: str) -> List[str]:
+    """Split 'cat.`my schema`.tbl' into parts, respecting backticks."""
+    parts, cur, q = [], "", False
+    for ch in s.strip():
+        if ch == "`":
+            q = not q
+        elif ch == "." and not q:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def clean_col(name: str) -> str:
+    name = name.strip().strip("`").strip()
+    if "." in name:                        # alias.col -> col
+        name = name.split(".")[-1].strip("`")
+    return name.lower()
+
+
+SQL_VAR_PATTERNS = [
+    (re.compile(r"\$\{([^}]+)\}"), lambda m: placeholder(m.group(1))),        # ${var}
+    (re.compile(r"\{\{\s*(\w+)\s*\}\}"), lambda m: placeholder(m.group(1))),  # {{var}}
+    (re.compile(r"\{(\w+)\}"), lambda m: placeholder(m.group(1))),            # {var}
+    (re.compile(r"(?<![\w:]):(?!:)([A-Za-z_]\w*)"), lambda m: placeholder(m.group(1))),  # :param
+    (re.compile(r"\$([A-Za-z_]\w*)"), lambda m: placeholder(m.group(1))),     # $var
+]
+
+
+def preprocess_sql(sql: str) -> str:
+    for pat, fn in SQL_VAR_PATTERNS:
+        sql = pat.sub(fn, sql)
+    return sql
+
+
+def split_sql_statements(sql: str) -> List[str]:
+    """Split on ';' outside quotes/comments."""
+    out, buf, i, n = [], [], 0, len(sql)
+    quote = None
+    while i < n:
+        c = sql[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and i + 1 < n:
+                buf.append(sql[i + 1]); i += 2; continue
+            if c == quote:
+                quote = None
+        elif c in "'\"`":
+            quote = c; buf.append(c)
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            buf.append(sql[i:j]); i = j; continue
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            buf.append(sql[i:j]); i = j; continue
+        elif c == ";":
+            out.append("".join(buf)); buf = []
+        else:
+            buf.append(c)
+        i += 1
+    out.append("".join(buf))
+    return [s for s in (x.strip() for x in out) if s and not re.fullmatch(r"(--[^\n]*\s*)+", s)]
+
+
+def qualify_kwargs(**kw):
+    """Pass only the options this sqlglot version supports."""
+    import inspect
+    params = inspect.signature(qualify).parameters
+    accepts_any = any(p.kind == p.VAR_KEYWORD for p in params.values())
+    out = {k: v for k, v in kw.items() if k in params or (accepts_any and k not in ("infer_schema",))}
+    out["dialect"] = DIALECT
+    return out
+
+
+# ----------------------------------------------------------------------------- notebook splitting
+CELL_SEP = re.compile(r"^[ \t]*(?:#|--|//)[ \t]*COMMAND -{3,}[ \t]*$", re.M)
+NB_HEADER = re.compile(r"^[ \t]*(?:#|--|//)[ \t]*Databricks notebook source[ \t]*$", re.M)
+MAGIC = re.compile(r"^[ \t]*(?:#|--|//) ?MAGIC ?")
+LANG_ALIASES = {"python": "python", "py": "python", "sql": "sql", "scala": "scala", "r": "r"}
+
+
+def split_cells(text: str, default_lang: str) -> List[Tuple[int, str, str]]:
+    """Return [(cell_no, language, code)] for a Databricks SOURCE export (or a plain file)."""
+    if text.lstrip().startswith("{") and '"cells"' in text[:5000]:
+        return split_ipynb(text, default_lang)
+    text = NB_HEADER.sub("", text, count=1)
+    cells = []
+    for i, raw in enumerate(CELL_SEP.split(text), 1):
+        lines = raw.split("\n")
+        nonblank = [l for l in lines if l.strip()]
+        if not nonblank:
+            continue
+        lang, body = default_lang, raw
+        if all(MAGIC.match(l) for l in nonblank):
+            stripped = [MAGIC.sub("", l, count=1) if l.strip() else "" for l in lines]
+            first_idx = next(k for k, l in enumerate(stripped) if l.strip())
+            m = re.match(r"\s*%(\w+)", stripped[first_idx])
+            if m:
+                magic = m.group(1).lower()
+                if magic not in LANG_ALIASES:
+                    continue                       # %md, %run, %pip, %sh, %fs ...
+                lang = LANG_ALIASES[magic]
+                stripped[first_idx] = stripped[first_idx].replace("%" + m.group(1), "", 1)
+            body = "\n".join(stripped)
+        cells.append((i, lang, body))
+    return cells
+
+
+def split_ipynb(text: str, default_lang: str) -> List[Tuple[int, str, str]]:
+    try:
+        nb = json.loads(text)
+    except Exception:
+        return [(1, default_lang, text)]
+    out = []
+    for i, c in enumerate(nb.get("cells", []), 1):
+        if c.get("cell_type") != "code":
+            continue
+        src = c.get("source", "")
+        src = "".join(src) if isinstance(src, list) else src
+        lang = default_lang
+        m = re.match(r"\s*%(\w+)", src)
+        if m:
+            magic = m.group(1).lower()
+            if magic not in LANG_ALIASES:
+                continue
+            lang = LANG_ALIASES[magic]
+            src = src.replace("%" + m.group(1), "", 1)
+        out.append((i, lang, src))
+    return out
+
+
+# ----------------------------------------------------------------------------- PySpark knowledge
+STR_COL_METHODS = {
+    "select", "groupBy", "groupby", "orderBy", "sort", "sortWithinPartitions", "drop",
+    "dropDuplicates", "drop_duplicates", "dropDuplicatesWithinWatermark", "cube", "rollup",
+    "repartition", "repartitionByRange", "describe", "pivot", "approxQuantile",
+}
+DF_PASSTHRU = {
+    "distinct", "limit", "sample", "cache", "persist", "coalesce", "hint", "alias",
+    "localCheckpoint", "checkpoint", "unpersist", "withWatermark", "dropna", "fillna",
+    "replace", "na", "transform", "offset",
+}
+DF_TERMINAL = {
+    "count", "collect", "show", "toPandas", "first", "head", "take", "tail", "isEmpty",
+    "printSchema", "explain", "toJSON", "foreach", "foreachPartition", "toLocalIterator",
+}
+DF_NONCOL_ATTRS = {
+    "columns", "dtypes", "schema", "rdd", "sparkSession", "sql_ctx", "isStreaming",
+    "storageLevel", "stat", "write", "writeStream", "na", "printSchema", "explain",
+}
+# pyspark.sql.functions that take column names as plain strings: name -> arg positions (None = all)
+FN_COL_ARGS = {
+    **{f: None for f in [
+        "sum", "avg", "mean", "max", "min", "count", "countDistinct", "count_distinct",
+        "approx_count_distinct", "first", "last", "collect_list", "collect_set", "stddev",
+        "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop", "sumDistinct",
+        "sum_distinct", "coalesce", "concat", "greatest", "least", "array", "struct",
+        "upper", "lower", "trim", "ltrim", "rtrim", "length", "year", "month", "dayofmonth",
+        "dayofweek", "dayofyear", "hour", "minute", "second", "quarter", "weekofyear",
+        "isnull", "isnan", "abs", "sqrt", "exp", "log", "explode", "explode_outer",
+        "posexplode", "size", "asc", "desc", "asc_nulls_first", "asc_nulls_last",
+        "desc_nulls_first", "desc_nulls_last", "md5", "sha1", "crc32", "hash", "xxhash64",
+        "initcap", "reverse", "soundex", "base64", "unbase64", "ascii", "bin", "hex",
+        "unhex", "floor", "ceil", "signum", "kurtosis", "skewness", "corr", "covar_pop",
+        "covar_samp", "max_by", "min_by", "nvl", "ifnull", "nullif", "last_day",
+        "to_json", "map_keys", "map_values", "array_distinct", "sort_array", "flatten",
+        "any_value", "bool_and", "bool_or", "median", "mode", "product",
+    ]},
+    "concat_ws": (1, None), "date_format": (0,), "to_date": (0,), "to_timestamp": (0,),
+    "round": (0,), "bround": (0,), "sha2": (0,), "substring": (0,), "regexp_replace": (0,),
+    "regexp_extract": (0,), "split": (0,), "lpad": (0,), "rpad": (0,),
+    "datediff": (0, 1), "months_between": (0, 1), "date_add": (0,), "date_sub": (0,),
+    "add_months": (0,), "format_number": (0,), "from_unixtime": (0,),
+    "unix_timestamp": (0,), "trunc": (0,), "date_trunc": (1,), "instr": (0,),
+    "locate": (1,), "translate": (0,), "array_contains": (0,), "element_at": (0,),
+    "get_json_object": (0,), "from_json": (0,), "percentile_approx": (0,),
+    "lag": (0,), "lead": (0,), "percentile": (0,), "when": (), "lit": (),
+}
+WINDOW_METHODS = {"partitionBy", "orderBy", "sortBy"}
+FUNCTIONS_MODULES = {"pyspark.sql.functions", "pyspark.sql.connect.functions"}
+
+
+# ----------------------------------------------------------------------------- analyzer
+class NotebookAnalyzer:
+    """Analyzes one script. State (variables, temp views, USE catalog) flows cell to cell."""
+
+    def __init__(self, default_catalog: str, default_schema: str,
+                 schema: Optional[Dict[TableKey, Set[str]]] = None):
+        self.cur_catalog = (default_catalog or "").lower()
+        self.cur_schema = (default_schema or "").lower()
+        self.schema = schema or {}
+        self.events: List[Event] = []
+        self.cell_no = 0
+        # python state
+        self.consts: Dict[str, str] = {}
+        self.const_lists: Dict[str, List[str]] = {}
+        self.vars: Dict[str, DF] = {}
+        self.window_cols: Dict[str, List[str]] = {}
+        self.fn_modules: Set[str] = {"F", "f", "fn", "sf", "psf", "functions"}
+        self.fn_names: Dict[str, str] = {}              # local name -> pyspark function name
+        # shared state
+        self.temp_views: Dict[str, FrozenSet[TableKey]] = {}
+
+    # ------------------------------------------------------------------ public
+    def analyze(self, cells: List[Tuple[int, str, str]]) -> List[Event]:
+        for cell_no, lang, code in cells:
+            self.cell_no = cell_no
+            try:
+                if lang == "sql":
+                    self.analyze_sql(code)
+                elif lang == "python":
+                    self.analyze_python(code)
+                elif lang == "scala":
+                    self.analyze_regex_code(code)
+            except RecursionError:
+                pass
+            except Exception as e:                      # never let one cell kill the scan
+                print(f"   ! cell {cell_no}: {type(e).__name__}: {e}")
+        return self.events
+
+    # ------------------------------------------------------------------ emit
+    def emit_table(self, key: TableKey, access: str, kind: str):
+        self.events.append(Event(self.cell_no, kind, access, (key,), None, "TABLE_ONLY"))
+
+    def emit_col(self, candidates: Iterable[TableKey], col: str, access: str, kind: str, res: str):
+        cands = tuple(sorted(set(candidates)))
+        if not cands or not col:
+            return
+        if res not in ("STAR",) and len(cands) > 1:
+            res = "AMBIGUOUS"
+        self.events.append(Event(self.cell_no, kind, access, cands, col.lower(), res))
+
+    def table_key(self, name: str) -> TableKey:
+        parts = split_ident(name)
+        if len(parts) >= 3:
+            return tuple(parts[-3:])                     # type: ignore
+        if len(parts) == 2:
+            return (self.cur_catalog, parts[0], parts[1])
+        return (self.cur_catalog, self.cur_schema, parts[0] if parts else name.lower())
+
+    # ================================================================== SQL
+    def analyze_sql(self, sql: str, kind: str = "SQL") -> DF:
+        """Analyze a SQL text (one or many statements). Returns info about the last query
+        (its source tables) so spark.sql(...) results can be tracked as DataFrames."""
+        result = DF(frozenset())
+        for stmt_text in split_sql_statements(preprocess_sql(sql)):
+            try:
+                stmts = sqlglot.parse(stmt_text, read=DIALECT)
+            except Exception:
+                self.sql_regex_fallback(stmt_text, kind)
+                continue
+            for stmt in stmts:
+                if stmt is None:
+                    continue
+                try:
+                    result = self.sql_statement(stmt, stmt_text, kind)
+                except Exception:
+                    self.sql_regex_fallback(stmt_text, kind)
+        return result
+
+    SQL_TABLE_RX = re.compile(
+        r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE|USING|OPTIMIZE|VACUUM|DESCRIBE(?:\s+(?:DETAIL|HISTORY|EXTENDED))?)"
+        r"\s+((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+)){0,2})", re.I)
+    SQL_NOT_TABLES = {"select", "values", "lateral", "table", "if", "exists", "not", "delta", "parquet"}
+
+    def sql_regex_fallback(self, text: str, kind: str):
+        write = bool(re.match(r"\s*(INSERT|MERGE|UPDATE|DELETE|CREATE|REPLACE|ALTER|DROP|TRUNCATE|OPTIMIZE|VACUUM)", text, re.I))
+        first = True
+        for m in self.SQL_TABLE_RX.finditer(text):
+            name = m.group(1)
+            if name.lower() in self.SQL_NOT_TABLES or name.startswith("("):
+                continue
+            key = self.table_key(name)
+            if key[2] in self.temp_views:
+                continue
+            self.emit_table(key, "WRITE" if (write and first) else "READ", kind)
+            first = False
+
+    def sql_statement(self, stmt: exp.Expression, text: str, kind: str) -> DF:
+        if isinstance(stmt, exp.Use):
+            target = stmt.this
+            name = target.name if target is not None else ""
+            k = (stmt.args.get("kind").name.upper() if stmt.args.get("kind") else "")
+            parts = split_ident(target.sql(dialect=DIALECT)) if target is not None else []
+            if k == "CATALOG":
+                self.cur_catalog = name.lower()
+            elif len(parts) == 2:
+                self.cur_catalog, self.cur_schema = parts
+            elif parts:
+                self.cur_schema = parts[0]
+            return DF(frozenset())
+
+        if isinstance(stmt, exp.Command):
+            self.sql_regex_fallback(text, kind)
+            return DF(frozenset())
+
+        if isinstance(stmt, exp.Create):
+            return self.sql_create(stmt, kind)
+        if isinstance(stmt, exp.Insert):
+            target_node = stmt.this
+            tbl = target_node.this if isinstance(target_node, exp.Schema) else target_node
+            if isinstance(tbl, exp.Table) and tbl.name:
+                key = self.key_of_table(tbl)
+                self.emit_table(key, "WRITE", kind)
+                if isinstance(target_node, exp.Schema):
+                    for ident in target_node.expressions:
+                        self.emit_col([key], ident.name, "WRITE", kind, "QUALIFIED")
+            q = self.query_part(stmt)
+            return self.analyze_query(q, kind) if q is not None else DF(frozenset())
+        if isinstance(stmt, (exp.Merge, exp.Update, exp.Delete)):
+            return self.sql_dml(stmt, kind)
+        if isinstance(stmt, exp.Query):
+            return self.analyze_query(stmt, kind)
+
+        # ALTER / DROP / TRUNCATE / DESCRIBE / CACHE / etc. -> table-level only
+        access = "READ" if isinstance(stmt, (exp.Describe, exp.Cache)) else "WRITE"
+        for t in stmt.find_all(exp.Table):
+            if t.name and t.name.lower() not in self.temp_views:
+                self.emit_table(self.key_of_table(t), access, kind)
+        return DF(frozenset())
+
+    @staticmethod
+    def query_part(stmt: exp.Expression) -> Optional[exp.Expression]:
+        q = stmt.args.get("expression")
+        if not isinstance(q, exp.Query):
+            return None
+        w = stmt.args.get("with")
+        if w is not None and q.args.get("with") is None:
+            q = q.copy(); q.set("with", w.copy())
+        return q
+
+    def sql_create(self, stmt: exp.Create, kind: str) -> DF:
+        target_node = stmt.this
+        tbl = target_node.this if isinstance(target_node, exp.Schema) else target_node
+        props = stmt.args.get("properties")
+        is_temp = bool(props and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions))
+        q = self.query_part(stmt)
+        info = self.analyze_query(q, kind) if q is not None else DF(frozenset())
+        if not isinstance(tbl, exp.Table) or not tbl.name:
+            return info
+        if is_temp:
+            self.temp_views[tbl.name.lower()] = info.tables
+            return info
+        key = self.key_of_table(tbl)
+        self.emit_table(key, "WRITE", kind)
+        if isinstance(target_node, exp.Schema):
+            for col_def in target_node.expressions:
+                if isinstance(col_def, (exp.ColumnDef, exp.Identifier)):
+                    self.emit_col([key], col_def.name, "WRITE", kind, "QUALIFIED")
+        return info
+
+    def key_of_table(self, t: exp.Table) -> TableKey:
+        cat = (t.catalog or "").lower() or self.cur_catalog
+        db = (t.db or "").lower() or self.cur_schema
+        return (cat, db, t.name.lower())
+
+    def sql_dml(self, stmt: exp.Expression, kind: str) -> DF:
+        """MERGE / UPDATE / DELETE."""
+        target = stmt.this
+        if not isinstance(target, exp.Table):
+            return DF(frozenset())
+        tkey = self.key_of_table(target)
+        self.emit_table(tkey, "WRITE", kind)
+        aliases: Dict[str, Tuple[TableKey, ...]] = {target.alias_or_name.lower(): (tkey,),
+                                                    target.name.lower(): (tkey,)}
+        nested_queries = []
+        using = stmt.args.get("using")
+        if isinstance(stmt, exp.Merge) and using is not None:
+            if isinstance(using, exp.Table):
+                ukey = self.resolve_table_or_view(using)
+                if ukey is not None:
+                    aliases[using.alias_or_name.lower()] = ukey
+                    aliases[using.name.lower()] = ukey
+                    for k in ukey:
+                        self.emit_table(k, "READ", kind)
+            else:                                       # USING (SELECT ...) s
+                sub = using.this if isinstance(using, exp.Subquery) else using
+                info = self.analyze_query(sub, kind) if isinstance(sub, exp.Query) else DF(frozenset())
+                aliases[using.alias_or_name.lower()] = tuple(info.tables)
+                nested_queries.append(using)
+        if isinstance(stmt, exp.Update) and stmt.args.get("from"):
+            for t in stmt.args["from"].find_all(exp.Table):
+                k = self.resolve_table_or_view(t)
+                if k:
+                    aliases[t.alias_or_name.lower()] = k
+                    for kk in k:
+                        self.emit_table(kk, "READ", kind)
+
+        # sub-queries inside WHERE / ON etc.
+        for sub in stmt.find_all(exp.Subquery):
+            if any(sub is n or sub in n.find_all(exp.Subquery) for n in nested_queries):
+                continue
+            if isinstance(sub.this, exp.Query):
+                self.analyze_query(sub.this, kind)
+                nested_queries.append(sub)
+
+        write_cols: Set[int] = set()
+        if isinstance(stmt, exp.Update):
+            for eq in stmt.expressions:
+                if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                    self.emit_col([tkey], eq.this.name, "WRITE", kind, "QUALIFIED")
+                    write_cols.add(id(eq.this))
+        if isinstance(stmt, exp.Merge):
+            whens = stmt.args.get("whens")
+            for when in (whens.expressions if whens is not None else []):
+                then = when.args.get("then")
+                if isinstance(then, exp.Update):
+                    for eq in then.expressions:
+                        if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                            self.emit_col([tkey], eq.this.name, "WRITE", kind, "QUALIFIED")
+                            write_cols.add(id(eq.this))
+                elif isinstance(then, exp.Insert) and isinstance(then.this, exp.Tuple):
+                    for c in then.this.expressions:
+                        if isinstance(c, exp.Column):
+                            self.emit_col([tkey], c.name, "WRITE", kind, "QUALIFIED")
+                            write_cols.add(id(c))
+
+        all_cands = tuple(sorted({k for v in aliases.values() for k in v}))
+        for col in stmt.find_all(exp.Column):
+            if id(col) in write_cols or isinstance(col.this, exp.Star):
+                continue
+            if any(col in q.find_all(exp.Column) for q in nested_queries):
+                continue
+            q = col.table.lower()
+            if q:
+                cands = aliases.get(q)
+                if cands:
+                    self.emit_col(cands, col.name, "READ", kind, "QUALIFIED")
+            else:
+                self.emit_col(all_cands, col.name, "READ", kind,
+                              "QUALIFIED" if len(all_cands) == 1 else "AMBIGUOUS")
+        return DF(frozenset())
+
+    def resolve_table_or_view(self, t: exp.Table) -> Optional[Tuple[TableKey, ...]]:
+        if not t.name:
+            return None
+        if not t.db and t.name.lower() in self.temp_views:
+            return tuple(self.temp_views[t.name.lower()])
+        return (self.key_of_table(t),)
+
+    # ------------------------------------------------------------------ SELECT analysis
+    def analyze_query(self, query: exp.Expression, kind: str) -> DF:
+        q = query.copy()
+        cte_names = {c.alias_or_name.lower() for c in q.find_all(exp.CTE)}
+        read_tables: Set[TableKey] = set()
+
+        # 1. make every physical table fully qualified, mark temp views
+        for t in list(q.find_all(exp.Table)):
+            if not t.name or not isinstance(t.this, exp.Identifier):
+                continue
+            name = t.name.lower()
+            if not t.db and name in cte_names:
+                continue
+            if not t.db and name in self.temp_views:
+                t.set("catalog", exp.to_identifier(TV)); t.set("db", exp.to_identifier(TV))
+                read_tables |= set(self.temp_views[name])
+                continue
+            key = self.key_of_table(t)
+            read_tables.add(key)
+            self.emit_table(key, "READ", kind)
+            t.set("catalog", exp.to_identifier(key[0] or NOCAT))
+            t.set("db", exp.to_identifier(key[1] or NODB))
+
+        # 2. schema for the qualifier (only tables whose columns we know)
+        mapping: Dict = {}
+        for t in q.find_all(exp.Table):
+            if not t.db or t.name.lower() in cte_names and not t.catalog:
+                continue
+            cat, db, name = t.catalog.lower(), t.db.lower(), t.name.lower()
+            if cat == TV:
+                cols: Set[str] = set()
+                for k in self.temp_views.get(name, ()):
+                    cols |= self.schema.get(k, set())
+            else:
+                cols = self.schema.get((cat if cat != NOCAT else "", db if db != NODB else "", name), set())
+            if cols:
+                mapping.setdefault(cat, {}).setdefault(db, {})[name] = {c: "STRING" for c in cols}
+
+        try:
+            qq = qualify(q.copy(), **qualify_kwargs(schema=mapping or None, validate_qualify_columns=False,
+                                                    quote_identifiers=False, identify=False,
+                                                    expand_stars=bool(mapping), infer_schema=False))
+        except Exception:
+            try:                                          # no schema / ambiguous: qualify tables only
+                qq = qualify(q.copy(), **qualify_kwargs(qualify_columns=False, quote_identifiers=False,
+                                                        identify=False, validate_qualify_columns=False))
+            except Exception:
+                qq = q
+
+        try:
+            scopes = traverse_scope(qq)
+        except Exception:
+            scopes = []
+        for scope in scopes:
+            try:
+                self.scope_columns(scope, kind)
+            except Exception as e:                       # keep going with other scopes
+                print(f"   ! scope skipped: {type(e).__name__}: {e}")
+
+        # outputs of the outermost select -> "derived" for DataFrame tracking
+        outputs: Set[str] = set()
+        has_star = False
+        sel = qq if isinstance(qq, exp.Select) else (qq.find(exp.Select) if qq else None)
+        if isinstance(sel, exp.Select):
+            for p in sel.selects:
+                if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)):
+                    has_star = True
+                elif isinstance(p, exp.Alias):
+                    outputs.add(p.alias.lower())
+                elif not has_star:
+                    outputs.add(p.alias_or_name.lower())
+        return DF(frozenset(read_tables), frozenset(outputs if not has_star else
+                                                     {p.alias.lower() for p in sel.selects if isinstance(p, exp.Alias)}))
+
+    def source_keys(self, source) -> Tuple[Tuple[TableKey, ...], str]:
+        """Physical tables behind a scope source (Table or temp view)."""
+        if isinstance(source, exp.Table):
+            cat, db, name = source.catalog.lower(), source.db.lower(), source.name.lower()
+            if cat == TV:
+                return tuple(self.temp_views.get(name, ())), "VIA_TEMP_VIEW"
+            return ((cat if cat != NOCAT else "", db if db != NODB else "", name),), "QUALIFIED"
+        return (), ""
+
+    def trace_through(self, sub: Scope, col: str, depth: int = 0) -> List[Tuple[Tuple[TableKey, ...], str]]:
+        """Column referenced from a derived table / CTE that the inner query only exposes via *."""
+        if depth > 8:
+            return []
+        set_scopes = getattr(sub, "set_operation_scopes", None) or getattr(sub, "union_scopes", None)
+        if set_scopes:
+            res = []
+            for us in set_scopes:
+                res += self.trace_through(us, col, depth + 1)
+            return res
+        expr = sub.expression
+        if not isinstance(expr, exp.Select):
+            return []
+        names = {p.alias_or_name.lower() for p in expr.selects}
+        if col in names:
+            return []                                   # inner scope reports its own columns
+        res = []
+        for p in expr.selects:
+            star_tbl = None
+            if isinstance(p, exp.Star):
+                star_tbl = "*"
+            elif isinstance(p, exp.Column) and isinstance(p.this, exp.Star):
+                star_tbl = p.table.lower() or "*"
+            if not star_tbl:
+                continue
+            for alias, src in sub.selected_sources.items():
+                if star_tbl != "*" and alias.lower() != star_tbl:
+                    continue
+                node = src[1] if isinstance(src, tuple) else src
+                if isinstance(node, Scope):
+                    res += self.trace_through(node, col, depth + 1)
+                else:
+                    keys, _ = self.source_keys(node)
+                    if keys:
+                        res.append((keys, "VIA_STAR"))
+        return res
+
+    def scope_columns(self, scope: Scope, kind: str):
+        sources = scope.sources                          # alias -> Table | Scope
+        expr = scope.expression
+        select_aliases = set()
+        if isinstance(expr, exp.Select):
+            select_aliases = {p.alias.lower() for p in expr.selects if isinstance(p, exp.Alias)}
+
+        # stars
+        if isinstance(expr, exp.Select):
+            for p in expr.selects:
+                tgt = None
+                if isinstance(p, exp.Star):
+                    tgt = "*"
+                elif isinstance(p, exp.Column) and isinstance(p.this, exp.Star):
+                    tgt = p.table.lower() or "*"
+                if not tgt:
+                    continue
+                for alias, src in sources.items():
+                    if tgt != "*" and alias.lower() != tgt:
+                        continue
+                    keys, res = self.source_keys(src)
+                    if keys:
+                        self.emit_col(keys, "*", "READ", kind, "STAR")
+
+        physical = []
+        for alias, src in sources.items():
+            keys, _ = self.source_keys(src)
+            physical.extend(keys)
+
+        own_select = expr if isinstance(expr, exp.Select) else None
+        for col in scope.columns:
+            name = col.name.lower()
+            if not name or isinstance(col.this, exp.Star):
+                continue
+            if own_select is not None and not col.table and col.find_ancestor(exp.Select) is not own_select:
+                continue                                 # belongs to a nested sub-query scope
+            tbl = col.table.lower()
+            if tbl:
+                src = sources.get(tbl) or sources.get(col.table)
+                if src is None:
+                    continue                             # lateral view alias, struct field etc.
+                if isinstance(src, Scope):
+                    for keys, res in self.trace_through(src, name):
+                        self.emit_col(keys, name, "READ", kind, res)
+                    continue
+                keys, res = self.source_keys(src)
+                if keys:
+                    self.emit_col(keys, name, "READ", kind, res)
+            else:
+                if name in select_aliases:
+                    continue
+                table_sources = [s for s in sources.values() if isinstance(s, exp.Table)]
+                scope_sources = [s for s in sources.values() if isinstance(s, Scope)]
+                if len(sources) == 1 and scope_sources:
+                    for keys, res in self.trace_through(scope_sources[0], name):
+                        self.emit_col(keys, name, "READ", kind, res)
+                    continue
+                if physical and not scope_sources:
+                    self.emit_col(physical, name, "READ", kind,
+                                  "QUALIFIED" if len(table_sources) == 1 else "AMBIGUOUS")
+                elif physical:
+                    self.emit_col(physical, name, "READ", kind, "AMBIGUOUS")
+
+    # ------------------------------------------------------------------ expression strings
+    def sql_expr_columns(self, text: str) -> Tuple[List[str], List[str]]:
+        """Columns and aliases in a SQL expression string (selectExpr / filter / F.expr)."""
+        try:
+            e = sqlglot.parse_one(preprocess_sql(text), read=DIALECT)
+        except Exception:
+            return [], []
+        cols = [c.name for c in e.find_all(exp.Column) if c.name and not isinstance(c.this, exp.Star)]
+        aliases = [a.alias for a in e.find_all(exp.Alias)]
+        return cols, aliases
+
+    # ================================================================== PYTHON
+    def analyze_python(self, code: str):
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # strip IPython-style lines (!pip, %magic) and try again, else regex
+            cleaned = "\n".join("" if re.match(r"\s*[!%]", l) else l for l in code.split("\n"))
+            try:
+                tree = ast.parse(cleaned)
+            except SyntaxError:
+                self.analyze_regex_code(code)
+                return
+        self.run_stmts(tree.body)
+
+    def run_stmts(self, stmts: List[ast.stmt]):
+        for s in stmts:
+            self.run_stmt(s)
+
+    def run_stmt(self, s: ast.stmt):
+        if isinstance(s, (ast.Import, ast.ImportFrom)):
+            self.handle_import(s)
+        elif isinstance(s, ast.Assign):
+            self.handle_assign(s.targets, s.value)
+        elif isinstance(s, ast.AnnAssign) and s.value is not None:
+            self.handle_assign([s.target], s.value)
+        elif isinstance(s, ast.AugAssign):
+            if isinstance(s.target, ast.Name) and isinstance(s.op, ast.Add):
+                add = self.str_of(s.value)
+                if s.target.id in self.consts and add is not None:
+                    self.consts[s.target.id] += add
+            self.ev(s.value)
+        elif isinstance(s, ast.For):
+            values = self.iter_values(s.iter)
+            if values and isinstance(s.target, ast.Name):
+                saved = self.consts.get(s.target.id)
+                for v in values[:50]:
+                    self.consts[s.target.id] = v
+                    self.run_stmts(s.body)
+                if saved is None:
+                    self.consts.pop(s.target.id, None)
+                else:
+                    self.consts[s.target.id] = saved
+            else:
+                self.ev(s.iter)
+                self.run_stmts(s.body)
+            self.run_stmts(s.orelse)
+        elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            self.run_stmts(s.body)
+        elif isinstance(s, (ast.If, ast.While)):
+            self.ev(s.test); self.run_stmts(s.body); self.run_stmts(s.orelse)
+        elif isinstance(s, (ast.With, ast.AsyncWith)):
+            for item in s.items:
+                self.ev(item.context_expr)
+            self.run_stmts(s.body)
+        elif isinstance(s, ast.Try) or type(s).__name__ == "TryStar":
+            self.run_stmts(s.body)
+            for h in s.handlers:
+                self.run_stmts(h.body)
+            self.run_stmts(s.orelse); self.run_stmts(s.finalbody)
+        elif isinstance(s, (ast.Expr, ast.Return)) and s.value is not None:
+            self.ev(s.value)
+        else:
+            for child in ast.iter_child_nodes(s):
+                if isinstance(child, ast.expr):
+                    self.ev(child)
+                elif isinstance(child, ast.stmt):
+                    self.run_stmt(child)
+
+    def handle_import(self, s):
+        if isinstance(s, ast.Import):
+            for a in s.names:
+                if a.name in FUNCTIONS_MODULES:
+                    self.fn_modules.add(a.asname or a.name)
+        else:
+            mod = s.module or ""
+            for a in s.names:
+                if mod in ("pyspark.sql", "pyspark.sql.connect") and a.name == "functions":
+                    self.fn_modules.add(a.asname or a.name)
+                elif mod in FUNCTIONS_MODULES:
+                    self.fn_names[a.asname or a.name] = a.name
+
+    def handle_assign(self, targets: List[ast.expr], value: ast.expr):
+        info = self.ev(value)
+        for tgt in targets:
+            if not isinstance(tgt, ast.Name):
+                continue
+            name = tgt.id
+            self.vars.pop(name, None)
+            if info is not None:
+                self.vars[name] = info
+                continue
+            s = self.str_of(value)
+            if s is not None:
+                self.consts[name] = s
+                continue
+            lst = self.iter_values(value)
+            if lst:
+                self.const_lists[name] = lst
+            wc = self.window_spec_cols(value)
+            if wc is not None:
+                self.window_cols[name] = wc
+
+    def iter_values(self, node) -> Optional[List[str]]:
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            vals = [self.str_of(e) for e in node.elts]
+            return vals if vals and all(v is not None for v in vals) else None
+        if isinstance(node, ast.Name):
+            return self.const_lists.get(node.id)
+        return None
+
+    # ------------------------------------------------------------------ strings
+    def str_of(self, node) -> Optional[str]:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return self.consts.get(node.id)
+        if isinstance(node, ast.JoinedStr):
+            out = []
+            for v in node.values:
+                if isinstance(v, ast.Constant):
+                    out.append(str(v.value))
+                elif isinstance(v, ast.FormattedValue):
+                    s = self.str_of(v.value)
+                    out.append(s if s is not None else placeholder(self.expr_name(v.value)))
+            return "".join(out)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            a, b = self.str_of(node.left), self.str_of(node.right)
+            if a is not None or b is not None:
+                return (a if a is not None else placeholder(self.expr_name(node.left))) + \
+                       (b if b is not None else placeholder(self.expr_name(node.right)))
+            return None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            base = self.str_of(node.left)
+            if base is None:
+                return None
+            vals = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            it = iter(vals)
+
+            def sub(m):
+                v = next(it, None)
+                s = self.str_of(v) if v is not None else None
+                return s if s is not None else placeholder(self.expr_name(v) if v is not None else "p")
+            return re.sub(r"%[sd]", sub, base)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            f = node.func
+            if f.attr == "format":
+                base = self.str_of(f.value)
+                if base is None:
+                    return None
+                kw = {k.arg: k.value for k in node.keywords if k.arg}
+                pos = list(node.args)
+                counter = iter(range(len(pos)))
+
+                def fsub(m):
+                    key = m.group(1)
+                    if key == "":
+                        idx = next(counter, None)
+                        v = pos[idx] if idx is not None and idx < len(pos) else None
+                    elif key.isdigit():
+                        v = pos[int(key)] if int(key) < len(pos) else None
+                    else:
+                        v = kw.get(key)
+                    s = self.str_of(v) if v is not None else self.consts.get(key)
+                    return s if s is not None else placeholder(key or "p")
+                return re.sub(r"\{(\w*)(?:[:!][^}]*)?\}", fsub, base)
+            if f.attr in ("strip", "lower", "upper", "replace") and f.attr != "replace":
+                base = self.str_of(f.value)
+                return getattr(base, f.attr)() if base is not None else None
+            if f.attr == "join":
+                sep = self.str_of(f.value)
+                vals = self.iter_values(node.args[0]) if node.args else None
+                if sep is not None and vals:
+                    return sep.join(vals)
+            if f.attr == "get" and isinstance(f.value, ast.Attribute) and f.value.attr == "widgets" and node.args:
+                key = self.str_of(node.args[0])
+                return placeholder("widget_" + key) if key else None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("getArgument",):
+            key = self.str_of(node.args[0]) if node.args else None
+            return placeholder("widget_" + key) if key else None
+        return None
+
+    @staticmethod
+    def expr_name(node) -> str:
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return "expr"
+
+    def strs_of(self, node) -> Optional[List[str]]:
+        s = self.str_of(node)
+        if s is not None:
+            return [s]
+        if isinstance(node, (ast.List, ast.Tuple)):
+            vals = [self.str_of(e) for e in node.elts]
+            if vals and all(v is not None for v in vals):
+                return vals
+        if isinstance(node, ast.Starred):
+            return self.strs_of(node.value)
+        if isinstance(node, ast.Name) and node.id in self.const_lists:
+            return self.const_lists[node.id]
+        return None
+
+    # ------------------------------------------------------------------ DataFrame evaluation
+    def ev(self, node) -> Optional[DF]:
+        if node is None:
+            return None
+        if isinstance(node, ast.Name):
+            return self.vars.get(node.id)
+        if isinstance(node, ast.Call):
+            return self.ev_call(node)
+        if isinstance(node, ast.Attribute):
+            base = self.ev(node.value)
+            if base is None:
+                return None
+            if base.writer:
+                return base
+            a = node.attr
+            if a in ("write", "writeStream"):
+                return replace(base, writer=True)
+            if a in ("na",):
+                return base
+            if a in DF_NONCOL_ATTRS or a in DF_PASSTHRU or a in DF_TERMINAL or a in STR_COL_METHODS:
+                return None
+            self.emit_df_cols(base, [a])
+            return None
+        if isinstance(node, ast.Subscript):
+            base = self.ev(node.value)
+            if base is not None and not base.writer:
+                strs = self.strs_of(node.slice)
+                if strs is not None:
+                    self.emit_df_cols(base, strs)
+                    return base if isinstance(node.slice, (ast.List, ast.Tuple)) else None
+                self.ev(node.slice)
+                return base                               # df[df.x > 1] -> filtered df
+            self.ev(node.slice)
+            return None
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                self.ev(child)
+            elif isinstance(child, ast.comprehension):
+                self.ev(child.iter)
+                for cond in child.ifs:
+                    self.ev(cond)
+        return None
+
+    def call_args(self, node: ast.Call) -> List[ast.expr]:
+        return list(node.args) + [k.value for k in node.keywords]
+
+    def ev_call(self, node: ast.Call) -> Optional[DF]:
+        f = node.func
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        if isinstance(f, ast.Attribute):
+            m = f.attr
+            arg0 = node.args[0] if node.args else None
+
+            if m == "table" and (arg0 is not None or "tableName" in kw):
+                self.ev(f.value)
+                s = self.str_of(arg0 if arg0 is not None else kw.get("tableName"))
+                if s:
+                    return self.df_for_table_name(s)
+                return None
+            if m == "forName" and len(node.args) >= 2:          # DeltaTable.forName(spark, "x")
+                s = self.str_of(node.args[1])
+                return self.df_for_table_name(s) if s else None
+            if m == "sql" and (arg0 is not None or "sqlQuery" in kw):
+                s = self.str_of(arg0 if arg0 is not None else kw.get("sqlQuery"))
+                for a in self.call_args(node)[1:]:
+                    self.ev(a)
+                if s:
+                    return self.analyze_sql(s, kind="SQL")
+                return None
+            if m in ("setCurrentCatalog", "setCurrentDatabase") and arg0 is not None:
+                s = self.str_of(arg0)
+                if s:
+                    if m == "setCurrentCatalog":
+                        self.cur_catalog = s.lower()
+                    else:
+                        self.cur_schema = s.lower()
+                return None
+            if m in ("saveAsTable", "insertInto", "toTable"):
+                recv = self.ev(f.value)
+                s = self.str_of(arg0 if arg0 is not None else kw.get("name") or kw.get("tableName"))
+                if s:
+                    self.emit_table(self.table_key(s), "WRITE", "PYSPARK")
+                for a in self.call_args(node)[1:]:
+                    self.ev(a)
+                return None
+            if m in ("createOrReplaceTempView", "createTempView", "createOrReplaceGlobalTempView",
+                     "createGlobalTempView", "registerTempTable"):
+                recv = self.ev(f.value)
+                s = self.str_of(arg0)
+                if recv is not None and s:
+                    self.temp_views[split_ident(s)[-1]] = recv.tables
+                return None
+
+            recv = self.ev(f.value)
+            if recv is None:
+                if m == "broadcast" and arg0 is not None:
+                    return self.ev(arg0)
+                if isinstance(f.value, ast.Name) and f.value.id == "DeltaTable" and m == "forName":
+                    return None
+                for a in self.call_args(node):
+                    self.ev(a)
+                return None
+            if recv.writer:
+                if m == "merge":                                   # DeltaTable merge
+                    pass
+                for a in self.call_args(node):
+                    self.ev(a)
+                return recv
+            return self.apply_method(recv, m, node)
+
+        if isinstance(f, ast.Name) and f.id == "broadcast" and node.args:
+            return self.ev(node.args[0])
+        if isinstance(f, ast.Name) and f.id == "display" and node.args:
+            for a in self.call_args(node):
+                self.ev(a)
+            return None
+        self.ev(f) if not isinstance(f, ast.Name) else None
+        for a in self.call_args(node):
+            self.ev(a)
+        return None
+
+    def df_for_table_name(self, s: str) -> DF:
+        parts = split_ident(s)
+        if len(parts) == 1 and parts[0] in self.temp_views:
+            return DF(frozenset(self.temp_views[parts[0]]))
+        if len(parts) == 2 and parts[0] == "global_temp" and parts[1] in self.temp_views:
+            return DF(frozenset(self.temp_views[parts[1]]))
+        key = self.table_key(s)
+        self.emit_table(key, "READ", "PYSPARK")
+        return DF(frozenset({key}))
+
+    def apply_method(self, recv: DF, m: str, node: ast.Call) -> Optional[DF]:
+        args = list(node.args)
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        tables, derived, aliases = set(recv.tables), set(recv.derived), set(recv.aliases)
+        union = recv.union
+        cur = DF(frozenset(tables), frozenset(derived), aliases=frozenset(aliases), union=union)
+
+        def cols_in(n):
+            names, aliases = self.col_exprs(n)
+            self.emit_df_cols(cur, names)
+            derived.update(a.lower() for a in aliases)
+
+        if m in STR_COL_METHODS:
+            for a in args + [kw[k] for k in ("cols", "subset", "col") if k in kw]:
+                strs = self.strs_of(a)
+                if strs is not None:
+                    self.emit_df_cols(cur, strs)
+                else:
+                    cols_in(a)
+        elif m == "selectExpr":
+            for a in args:
+                for s in (self.strs_of(a) or []):
+                    c, al = self.sql_expr_columns(s)
+                    self.emit_df_cols(cur, c)
+                    derived.update(x.lower() for x in al)
+        elif m in ("filter", "where"):
+            for a in args + list(kw.values()):
+                s = self.str_of(a)
+                if s is not None:
+                    self.emit_df_cols(cur, self.sql_expr_columns(s)[0])
+                else:
+                    cols_in(a)
+        elif m == "withColumn":
+            if len(args) >= 2:
+                cols_in(args[1])
+            n = self.str_of(args[0]) if args else None
+            if n:
+                derived.add(n.lower())
+        elif m == "withColumns":
+            if args and isinstance(args[0], ast.Dict):
+                for k, v in zip(args[0].keys, args[0].values):
+                    cols_in(v)
+                    ks = self.str_of(k)
+                    if ks:
+                        derived.add(ks.lower())
+        elif m == "withColumnRenamed":
+            old = self.str_of(args[0]) if args else None
+            new = self.str_of(args[1]) if len(args) > 1 else None
+            if old:
+                self.emit_df_cols(cur, [old])
+            if new:
+                derived.add(new.lower())
+        elif m == "withColumnsRenamed":
+            if args and isinstance(args[0], ast.Dict):
+                for k, v in zip(args[0].keys, args[0].values):
+                    ks, vs = self.str_of(k), self.str_of(v)
+                    if ks:
+                        self.emit_df_cols(cur, [ks])
+                    if vs:
+                        derived.add(vs.lower())
+        elif m == "agg":
+            for a in args:
+                if isinstance(a, ast.Dict):
+                    keys = [self.str_of(k) for k in a.keys]
+                    self.emit_df_cols(cur, [k for k in keys if k])
+                else:
+                    cols_in(a)
+        elif m in ("join", "crossJoin", "union", "unionByName", "unionAll", "intersect",
+                   "intersectAll", "subtract", "exceptAll"):
+            other = self.ev(args[0]) if args else None
+            if other is not None:
+                tables |= other.tables
+                derived |= other.derived
+                aliases |= other.aliases
+            if m.startswith("union") or m in ("intersect", "intersectAll", "subtract", "exceptAll"):
+                union = True
+            elif m in ("join", "crossJoin"):
+                union = False
+            cur = DF(frozenset(tables), frozenset(derived), aliases=frozenset(aliases), union=union)
+            if m == "join":
+                on = args[1] if len(args) > 1 else kw.get("on")
+                if on is not None:
+                    strs = self.strs_of(on)
+                    if strs is not None:
+                        self.emit_df_cols(cur, strs)
+                    else:
+                        cols_in(on)
+                for k in ("how",):
+                    if k in kw:
+                        self.ev(kw[k])
+        elif m in ("fillna", "dropna", "replace"):
+            sub = kw.get("subset")
+            if sub is not None:
+                self.emit_df_cols(cur, self.strs_of(sub) or [])
+            if m == "fillna" and args and isinstance(args[0], ast.Dict):
+                self.emit_df_cols(cur, [s for s in (self.str_of(k) for k in args[0].keys) if s])
+        elif m in DF_TERMINAL:
+            for a in self.call_args(node):
+                self.ev(a)
+            return None
+        elif m in ("toDF",):
+            for a in args:
+                s = self.str_of(a)
+                if s:
+                    derived.add(s.lower())
+        elif m in DF_PASSTHRU:
+            if m == "alias" and args:
+                al = self.str_of(args[0])
+                if al:
+                    aliases.add((al.lower(), frozenset(tables)))
+            for a in self.call_args(node):
+                self.ev(a)
+        else:
+            for a in self.call_args(node):            # unknown method: still harvest col("x") refs
+                cols_in(a)
+
+        return DF(frozenset(tables), frozenset(derived), aliases=frozenset(aliases), union=union)
+
+    def col_exprs(self, node) -> Tuple[List[str], List[str]]:
+        """Column names referenced (and aliases created) inside a Column expression."""
+        names: List[str] = []
+        aliases: List[str] = []
+        if node is None:
+            return names, aliases
+        self.ev(node)                                   # catches df.col / df["col"] and nested dfs
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in self.window_cols:
+                names += self.window_cols[n.id]
+            if not isinstance(n, ast.Call):
+                continue
+            fname, is_fn = self.fn_name(n.func)
+            if isinstance(n.func, ast.Attribute) and n.func.attr in ("alias", "name", "as_") and n.args:
+                s = self.str_of(n.args[0])
+                if s:
+                    aliases.append(s)
+                continue
+            if isinstance(n.func, ast.Attribute) and n.func.attr in WINDOW_METHODS and \
+                    self.root_name(n.func) == "Window":
+                for a in n.args:
+                    names += self.strs_of(a) or []
+                continue
+            if not is_fn or not fname:
+                continue
+            if fname in ("col", "column"):
+                if n.args:
+                    s = self.str_of(n.args[0])
+                    if s:
+                        names.append(s)
+            elif fname == "expr":
+                if n.args:
+                    s = self.str_of(n.args[0])
+                    if s:
+                        c, al = self.sql_expr_columns(s)
+                        names += c
+                        aliases += al
+            elif fname in FN_COL_ARGS:
+                spec = FN_COL_ARGS[fname]
+                if spec is None:
+                    idxs = range(len(n.args))
+                elif len(spec) == 2 and spec[1] is None:
+                    idxs = range(spec[0], len(n.args))
+                else:
+                    idxs = [i for i in spec if i < len(n.args)]
+                for i in idxs:
+                    a = n.args[i]
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        names.append(a.value)
+        return names, aliases
+
+    def fn_name(self, func) -> Tuple[Optional[str], bool]:
+        """('col', True) if func is a pyspark.sql.functions function."""
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and \
+                func.value.id in self.fn_modules:
+            return func.attr, True
+        if isinstance(func, ast.Name):
+            if func.id in self.fn_names:
+                return self.fn_names[func.id], True
+            if func.id in ("col", "column", "expr"):
+                return func.id, True
+        return None, False
+
+    @staticmethod
+    def root_name(node) -> Optional[str]:
+        while isinstance(node, (ast.Attribute, ast.Call)):
+            node = node.value if isinstance(node, ast.Attribute) else node.func
+        return node.id if isinstance(node, ast.Name) else None
+
+    def window_spec_cols(self, node) -> Optional[List[str]]:
+        if self.root_name(node) != "Window":
+            return None
+        cols = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in WINDOW_METHODS:
+                for a in n.args:
+                    cols += self.strs_of(a) or []
+                    if isinstance(a, ast.Call):
+                        cols += self.col_exprs(a)[0]
+        return cols
+
+    def emit_df_cols(self, df: DF, names: Iterable[str]):
+        if df is None or not df.tables:
+            return
+        alias_map = {a: t for a, t in df.aliases}
+        for raw in names:
+            if not raw:
+                continue
+            c = clean_col(raw)
+            if not c or c == "*" or c in df.derived or not re.match(r"^[\w$ ]+$", c):
+                continue
+            tables = df.tables
+            qual = split_ident(raw)[0] if "." in raw else ""
+            if qual and qual in alias_map and alias_map[qual]:
+                tables = alias_map[qual]
+            elif df.union and len(tables) > 1:
+                for t in tables:
+                    self.emit_col([t], c, "READ", "PYSPARK", "VIA_UNION")
+                continue
+            self.emit_col(tables, c, "READ", "PYSPARK",
+                          "SINGLE_SOURCE" if len(tables) == 1 else "AMBIGUOUS")
+
+    # ------------------------------------------------------------------ regex fallback (scala / broken python)
+    RX_SQL = re.compile(r"""\.sql\(\s*[sf]?(\"\"\"|'''|\"|')(.*?)\1""", re.S)
+    RX_TABLE = re.compile(r"""\.(?:table|forName)\(\s*(?:\w+\s*,\s*)?[sf]?(\"|')([^\"']+)\1""")
+    RX_WRITE = re.compile(r"""\.(?:saveAsTable|insertInto|toTable)\(\s*[sf]?(\"|')([^\"']+)\1""")
+
+    def analyze_regex_code(self, code: str):
+        for m in self.RX_SQL.finditer(code):
+            self.analyze_sql(m.group(2))
+        for m in self.RX_TABLE.finditer(code):
+            self.df_for_table_name(preprocess_sql(m.group(2)))
+        for m in self.RX_WRITE.finditer(code):
+            self.emit_table(self.table_key(preprocess_sql(m.group(2))), "WRITE", "PYSPARK")
+
+
+# ----------------------------------------------------------------------------- scanning & resolving
+def analyze_script(script: Script, default_catalog: str, default_schema: str,
+                   schema: Optional[Dict[TableKey, Set[str]]] = None) -> List[Event]:
+    cells = split_cells(script.text, script.language)
+    return NotebookAnalyzer(default_catalog, default_schema, schema).analyze(cells)
+
+
+def is_unknown(key: TableKey) -> bool:
+    return any(PH_RX.search(p or "") for p in key)
+
+
+def resolve_rows(script: Script, events: List[Event], schema: Dict[TableKey, Set[str]],
+                 keep_not_found: bool = False) -> List[dict]:
+    rows = []
+    for e in events:
+        cands = [c for c in e.candidates if c and c[2]]
+        if not cands:
+            continue
+        if e.column is None:
+            out = [(c, "", "TABLE_ONLY") for c in cands]
+        elif e.column == "*":
+            out = []
+            for c in cands:
+                if schema.get(c):
+                    out += [(c, col, "STAR_EXPANDED") for col in sorted(schema[c])]
+                else:
+                    out.append((c, "*", "STAR"))
+        else:
+            known = [c for c in cands if c in schema]
+            matches = [c for c in known if e.column in schema[c]]
+            unknown = [c for c in cands if c not in schema]
+            if matches:
+                res = "VERIFIED" if len(matches) == 1 else "AMBIGUOUS"
+                out = [(c, e.column, res) for c in matches]
+            elif unknown:
+                res = e.resolution if len(unknown) == 1 else "AMBIGUOUS"
+                if len(unknown) == 1 and res == "AMBIGUOUS" and len(cands) > 1:
+                    res = "INFERRED"                      # every other candidate ruled out
+                out = [(c, e.column, res) for c in unknown]
+            else:
+                out = [(c, e.column, "NOT_IN_TABLE") for c in cands] if keep_not_found else []
+        for (cat, db, tbl), col, res in out:
+            rows.append({
+                "script_path": script.path, "script_type": script.script_type,
+                "language": script.language, "cell_no": e.cell_no,
+                "source_kind": e.source_kind, "access_type": e.access_type,
+                "catalog_name": pretty(cat), "schema_name": pretty(db), "table_name": pretty(tbl),
+                "column_name": col, "resolution": res,
+            })
+    return dedupe(rows)
+
+
+RES_RANK = ["VERIFIED", "QUALIFIED", "SINGLE_SOURCE", "VIA_TEMP_VIEW", "VIA_STAR", "VIA_UNION", "INFERRED",
+            "STAR_EXPANDED", "STAR", "AMBIGUOUS", "NOT_IN_TABLE", "TABLE_ONLY"]
+
+
+def dedupe(rows: List[dict]) -> List[dict]:
+    """One row per (script, table, column, access); keep the best resolution & first cell;
+    drop TABLE_ONLY rows for tables that already have column rows."""
+    best: Dict[tuple, dict] = {}
+    for r in rows:
+        k = (r["script_path"], r["catalog_name"], r["schema_name"], r["table_name"],
+             r["column_name"], r["access_type"])
+        cur = best.get(k)
+        if cur is None:
+            best[k] = r
+        else:
+            rank = lambda x: RES_RANK.index(x) if x in RES_RANK else 99
+            if rank(r["resolution"]) < rank(cur["resolution"]):
+                r = dict(r, cell_no=min(r["cell_no"], cur["cell_no"]))
+                best[k] = r
+            else:
+                cur["cell_no"] = min(cur["cell_no"], r["cell_no"])
+    with_cols = {(r["script_path"], r["catalog_name"], r["schema_name"], r["table_name"], r["access_type"])
+                 for r in best.values() if r["column_name"]}
+    out = [r for r in best.values()
+           if r["column_name"] or (r["script_path"], r["catalog_name"], r["schema_name"],
+                                   r["table_name"], r["access_type"]) not in with_cols]
+    return sorted(out, key=lambda r: (r["script_path"], r["catalog_name"], r["schema_name"],
+                                      r["table_name"], r["access_type"], r["column_name"]))
+
+
+def run_scan(scripts: List[Script], default_catalog: str, default_schema: str,
+             fetch_schema=None, keep_not_found: bool = False,
+             static_schema: Optional[Dict[TableKey, Set[str]]] = None) -> List[dict]:
+    """Pass 1: find tables. Fetch their real columns. Pass 2: resolve columns against them."""
+    print(f"Pass 1: parsing {len(scripts)} scripts ...")
+    pass1 = {}
+    for i, s in enumerate(scripts, 1):
+        if i % 50 == 0:
+            print(f"   {i}/{len(scripts)}")
+        pass1[s.path] = analyze_script(s, default_catalog, default_schema)
+
+    schema: Dict[TableKey, Set[str]] = dict(static_schema or {})
+    if fetch_schema is not None:
+        tables = {c for evs in pass1.values() for e in evs for c in e.candidates
+                  if c and c[0] and c[1] and c[2] and not is_unknown(c) and c not in schema}
+        print(f"Fetching column lists for {len(tables)} tables ...")
+        schema.update(fetch_schema(tables))
+        print(f"   got columns for {sum(1 for t in tables if t in schema)} tables")
+
+    rows = []
+    if schema:
+        print("Pass 2: resolving columns against table schemas ...")
+        for s in scripts:
+            events = analyze_script(s, default_catalog, default_schema, schema)
+            rows += resolve_rows(s, events, schema, keep_not_found)
+    else:
+        for s in scripts:
+            rows += resolve_rows(s, pass1[s.path], schema, keep_not_found)
+    return rows
+
+
+def write_csv(rows: List[dict], path: str):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def print_summary(rows: List[dict]):
+    scripts = {r["script_path"] for r in rows}
+    tables = {(r["catalog_name"], r["schema_name"], r["table_name"]) for r in rows}
+    cols = {(r["catalog_name"], r["schema_name"], r["table_name"], r["column_name"]) for r in rows if r["column_name"]}
+    by_res: Dict[str, int] = {}
+    for r in rows:
+        by_res[r["resolution"]] = by_res.get(r["resolution"], 0) + 1
+    print(f"\n{len(rows)} rows | {len(scripts)} scripts | {len(tables)} tables | {len(cols)} distinct columns")
+    for k in sorted(by_res, key=lambda x: -by_res[x]):
+        print(f"   {k:<15} {by_res[k]}")
+
+
+# ----------------------------------------------------------------------------- local folder mode
+EXT_LANG = {".py": "python", ".sql": "sql", ".scala": "scala", ".ipynb": "python"}
+
+
+def scripts_from_folder(root: str, excludes: List[str]) -> List[Script]:
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in EXT_LANG:
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+            if any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(full, p) for p in excludes):
+                continue
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            is_nb = bool(NB_HEADER.search(text[:200])) or ext == ".ipynb"
+            out.append(Script(rel, "NOTEBOOK" if is_nb else "FILE", EXT_LANG[ext], text))
+    return out
+
+
+def load_schema_csv(path: str) -> Dict[TableKey, Set[str]]:
+    """CSV with columns table_catalog, table_schema, table_name, column_name."""
+    schema: Dict[TableKey, Set[str]] = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            r = {k.lower(): (v or "").strip().lower() for k, v in r.items()}
+            key = (r.get("table_catalog") or r.get("catalog_name", ""),
+                   r.get("table_schema") or r.get("schema_name", ""),
+                   r.get("table_name", ""))
+            schema.setdefault(key, set()).add(r.get("column_name", ""))
+    return schema
+
+
+def main_cli():
+    import argparse
+    p = argparse.ArgumentParser(description="Map tables & columns used by scripts in a folder.")
+    p.add_argument("--path", required=True, help="folder with exported notebooks / scripts")
+    p.add_argument("--out", default="table_column_usage.csv")
+    p.add_argument("--default-catalog", default="")
+    p.add_argument("--default-schema", default="")
+    p.add_argument("--schema-csv", help="optional information_schema.columns export for verification")
+    p.add_argument("--exclude", default="", help="comma-separated glob patterns to skip")
+    p.add_argument("--keep-not-found", action="store_true")
+    a = p.parse_args()
+    scripts = scripts_from_folder(a.path, [x.strip() for x in a.exclude.split(",") if x.strip()])
+    static = load_schema_csv(a.schema_csv) if a.schema_csv else None
+    rows = run_scan(scripts, a.default_catalog, a.default_schema,
+                    keep_not_found=a.keep_not_found, static_schema=static)
+    write_csv(rows, a.out)
+    print_summary(rows)
+    print(f"\nSaved -> {a.out}")
+
+
+# COMMAND ----------
+
+# ----------------------------------------------------------------------------- Databricks mode
+def databricks_main():
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.workspace import ExportFormat, ObjectType
+
+    me = spark.sql("SELECT current_user()").first()[0]  # noqa: F821
+    dbutils.widgets.text("scan_paths", f"/Users/{me},/Repos/{me}", "1. Folders to scan (comma-separated)")  # noqa: F821
+    dbutils.widgets.text("exclude_patterns", "*/.Trash*,*/.ipynb_checkpoints/*", "2. Exclude globs")  # noqa: F821
+    dbutils.widgets.text("default_catalog", "", "3. Default catalog (blank = current)")  # noqa: F821
+    dbutils.widgets.text("default_schema", "", "4. Default schema (blank = current)")  # noqa: F821
+    dbutils.widgets.dropdown("verify_with_information_schema", "yes", ["yes", "no"], "5. Verify columns")  # noqa: F821
+    dbutils.widgets.text("output_csv", f"/Workspace/Users/{me}/table_column_usage.csv", "6. Output CSV")  # noqa: F821
+    dbutils.widgets.text("output_table", "", "7. Output Delta table (optional, cat.schema.tbl)")  # noqa: F821
+
+    W = dbutils.widgets.get  # noqa: F821
+    roots = [p.strip().rstrip("/") or "/" for p in W("scan_paths").split(",") if p.strip()]
+    excludes = [p.strip() for p in W("exclude_patterns").split(",") if p.strip()]
+    default_catalog = W("default_catalog") or spark.sql("SELECT current_catalog()").first()[0]  # noqa: F821
+    default_schema = W("default_schema") or spark.sql("SELECT current_schema()").first()[0]  # noqa: F821
+    verify = W("verify_with_information_schema") == "yes"
+    out_csv, out_table = W("output_csv").strip(), W("output_table").strip()
+    print(f"Defaults: catalog={default_catalog}, schema={default_schema}")
+
+    w = WorkspaceClient()
+
+    # --- 1. list
+    objects = []
+    stack = list(roots)
+    seen = set()
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            items = list(w.workspace.list(p))
+        except Exception as e:
+            print(f"   skip {p}: {str(e)[:120]}")
+            continue
+        for o in items:
+            if any(fnmatch.fnmatch(o.path, pat) for pat in excludes):
+                continue
+            if o.object_type in (ObjectType.DIRECTORY, ObjectType.REPO):
+                stack.append(o.path)
+            elif o.object_type == ObjectType.NOTEBOOK:
+                objects.append(o)
+            elif o.object_type == ObjectType.FILE and os.path.splitext(o.path)[1].lower() in EXT_LANG:
+                objects.append(o)
+    print(f"Found {len(objects)} notebooks/files under {roots}")
+
+    # --- 2. export
+    def fetch(o):
+        lang = (o.language.value.lower() if o.language else
+                EXT_LANG.get(os.path.splitext(o.path)[1].lower(), "python"))
+        stype = "NOTEBOOK" if o.object_type == ObjectType.NOTEBOOK else "FILE"
+        text = None
+        for fmt in (ExportFormat.SOURCE, ExportFormat.AUTO):
+            try:
+                text = base64.b64decode(w.workspace.export(o.path, format=fmt).content or b"").decode("utf-8", "replace")
+                break
+            except Exception:
+                continue
+        if text is None and stype == "FILE":
+            try:
+                with open("/Workspace" + o.path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except Exception:
+                pass
+        return Script(o.path, stype, lang, text) if text else None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        scripts = [s for s in pool.map(fetch, objects) if s]
+    print(f"Exported {len(scripts)} scripts")
+
+    # --- 3. schema fetcher (information_schema, then per-table fallback)
+    def fetch_schema(tables: Set[TableKey]) -> Dict[TableKey, Set[str]]:
+        result: Dict[TableKey, Set[str]] = {}
+        by_cat: Dict[str, Set[TableKey]] = {}
+        for t in tables:
+            by_cat.setdefault(t[0], set()).add(t)
+        for cat, keys in by_cat.items():
+            if cat == "hive_metastore":
+                continue
+            keys = sorted(keys)
+            for i in range(0, len(keys), 300):
+                chunk = keys[i:i + 300]
+                in_list = ",".join("'" + f"{s}.{t}".replace("'", "''") + "'" for _, s, t in chunk)
+                q = (f"SELECT lower(table_schema) s, lower(table_name) t, lower(column_name) c "
+                     f"FROM `{cat}`.information_schema.columns "
+                     f"WHERE lower(concat(table_schema, '.', table_name)) IN ({in_list})")
+                try:
+                    for r in spark.sql(q).collect():  # noqa: F821
+                        result.setdefault((cat, r["s"], r["t"]), set()).add(r["c"])
+                except Exception as e:
+                    print(f"   information_schema unavailable for {cat}: {str(e)[:100]}")
+                    break
+        missing = [t for t in tables if t not in result]
+        for t in missing[:500]:                        # views / hive_metastore / no info-schema access
+            try:
+                fq = ".".join(f"`{p}`" for p in t)
+                result[t] = {c.lower() for c in spark.table(fq).columns}  # noqa: F821
+            except Exception:
+                pass
+        return result
+
+    rows = run_scan(scripts, default_catalog, default_schema,
+                    fetch_schema=fetch_schema if verify else None)
+    print_summary(rows)
+
+    # --- 4. save
+    if out_csv:
+        try:
+            write_csv(rows, out_csv)
+            print(f"Saved CSV -> {out_csv}")
+        except Exception as e:
+            print(f"Could not write {out_csv}: {e}")
+    import pandas as pd
+    pdf = pd.DataFrame(rows, columns=OUTPUT_COLUMNS).astype({"cell_no": "int64"})
+    sdf = spark.createDataFrame(pdf) if len(pdf) else None  # noqa: F821
+    if out_table and sdf is not None:
+        sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(out_table)
+        print(f"Saved table -> {out_table}")
+    if sdf is not None:
+        display(sdf)  # noqa: F821
+
+
+# COMMAND ----------
+
+if IN_DATABRICKS:
+    databricks_main()
+elif __name__ == "__main__":
+    main_cli()
